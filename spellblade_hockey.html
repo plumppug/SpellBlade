@@ -1,0 +1,2735 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Spellblade Hockey</title>
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Press+Start+2P&display=swap" rel="stylesheet">
+<style>
+  html, body { margin: 0; width: 100%; height: 100%; background: #0f1224; overflow: hidden; }
+  body {
+    position: fixed; inset: 0;
+    background-color: #0f1224;
+    background-image: linear-gradient(#141833 1px, transparent 1px), linear-gradient(90deg, #141833 1px, transparent 1px);
+    background-size: 8px 8px;
+    font-family: 'Press Start 2P', monospace; color: #7f8bb5;
+  }
+  canvas {
+    position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%);
+    display: block; background: #0f1224; outline: none;
+    image-rendering: crisp-edges; image-rendering: pixelated;
+  }
+  #fs {
+    position: fixed; right: 8px; bottom: 8px; z-index: 5; opacity: .45;
+    font: 8px 'Press Start 2P', monospace; color: #e4f7ff; background: #14182b;
+    border: 2px solid #2b3158; padding: 6px 8px; cursor: pointer;
+  }
+  #fs:hover { opacity: 1; }
+</style>
+</head>
+<body>
+<canvas id="c" width="480" height="300" tabindex="0"></canvas>
+<div id="fs" title="Toggle fullscreen (F)">[F] FULLSCREEN</div>
+
+<script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+<script>
+/* Show any error on screen so it can be reported/fixed */
+window.addEventListener('error', function (e) {
+  try {
+    var d = document.getElementById('errbox');
+    if (!d) {
+      d = document.createElement('div'); d.id = 'errbox';
+      d.style.cssText = 'position:fixed;left:0;right:0;top:0;padding:10px;background:#d62839;color:#fff;font:12px/16px monospace;z-index:99;white-space:pre-wrap';
+      document.body.appendChild(d);
+    }
+    d.textContent += 'ERROR: ' + (e.message || 'unknown') + ' (line ' + e.lineno + ')\n';
+  } catch (x) {}
+});
+</script>
+<script>
+(() => {
+'use strict';
+
+/* =====================================================================
+   SPELLBLADE HOCKEY  -  8/16-bit pixel hockey with spells
+   Internal resolution 480x300, scaled up with nearest-neighbour.
+   ===================================================================== */
+
+const W = 480, H = 300;
+const cv = document.getElementById('c');
+cv.width = W; cv.height = H;
+const ctx = cv.getContext('2d');
+ctx.imageSmoothingEnabled = false;
+
+/* Scale the game to fill as much of the window as the 16:10 aspect allows. */
+function resize() {
+  const vw = window.innerWidth || document.documentElement.clientWidth || W;
+  const vh = window.innerHeight || document.documentElement.clientHeight || H;
+  const sc = Math.max(0.5, Math.min(vw / W, vh / H));
+  cv.style.width = Math.floor(W * sc) + 'px';
+  cv.style.height = Math.floor(H * sc) + 'px';
+}
+addEventListener('resize', resize); resize();
+addEventListener('orientationchange', resize);
+document.addEventListener('fullscreenchange', () => { resize(); setTimeout(resize, 150); });
+function toggleFullscreen() {
+  try {
+    const d = document, el = d.documentElement;
+    if (d.fullscreenElement || d.webkitFullscreenElement) (d.exitFullscreen || d.webkitExitFullscreen).call(d);
+    else (el.requestFullscreen || el.webkitRequestFullscreen).call(el);
+  } catch (err) {}
+}
+const fsBtn = document.getElementById('fs');
+if (fsBtn) fsBtn.addEventListener('click', e => { e.stopPropagation(); toggleFullscreen(); try { cv.focus(); } catch (x) {} });
+
+if (document.fonts && document.fonts.load) {
+  ['8px', '16px', '24px', '32px'].forEach(s => document.fonts.load(s + ' "Press Start 2P"').catch(() => {}));
+}
+
+/* ---------- constants ---------- */
+const L = 14, R = 466, T = 36, B = 292, CY = (T + B) / 2;
+const MOUTH = 28, NET_D = 12, CORNER = 30;
+const STEP = 1 / 120;
+const PR = 6.5, BR = 4, BL = 15;
+const MAXV = 120, TURN = 15;
+// stick-control tuning
+const SNAP_R = 25, SNAP_V = 230;                       // magnet radius (px) and the fastest loose puck a stick can still gather
+const CHARGE_T = 0.8, SHOT_MIN = 170, SHOT_MAX = 320;  // seconds to a full charge; shot speed range (px/s)
+const DEKE_T = 0.26, DEKE_V = 205;                     // side-step length and speed
+const SPIN_T = 0.55;                                   // Spin-O-Rama duration
+const GR = 7, GV = 58;
+const FIRE_V = 440, FIRE_RANGE = 48, MANA_TIME = 7, MATCH_TIME = 90;
+const SCORE_LIMIT = 5, RES_READY = 1.4;      // first to 5 goals wins early; results buttons unlock after 1.4s (so spell-mashing can't skip the stats)
+const clamp = (v, a, b) => v < a ? a : v > b ? b : v;
+const rnd = (a, b) => a + Math.random() * (b - a);
+const pick = a => a[Math.floor(Math.random() * a.length)];
+
+/* ---------- audio (tiny WebAudio chiptune) ---------- */
+let AC = null, muted = false;
+const lastSfx = {};
+function initAudio() {
+  if (!AC) { try { AC = new (window.AudioContext || window.webkitAudioContext)(); } catch (e) { AC = null; } }
+  if (AC && AC.state === 'suspended') AC.resume();
+}
+function tone(f, d, type = 'square', v = 0.05, f2 = null, delay = 0) {
+  if (!AC || muted) return;
+  const t = AC.currentTime + delay;
+  const o = AC.createOscillator(), g = AC.createGain();
+  o.type = type;
+  o.frequency.setValueAtTime(f, t);
+  if (f2) o.frequency.exponentialRampToValueAtTime(f2, t + d);
+  g.gain.setValueAtTime(v, t);
+  g.gain.exponentialRampToValueAtTime(0.0001, t + d);
+  o.connect(g); g.connect(AC.destination);
+  o.start(t); o.stop(t + d + 0.03);
+}
+function sfx(n) {
+  if (NET.role === 'host' && NET.inMatch && n !== 'ready') NET.ev.push(['s', n]);
+  const now = performance.now();
+  if (lastSfx[n] && now - lastSfx[n] < 45) return;
+  lastSfx[n] = now;
+  switch (n) {
+    case 'hit':   tone(200, .06, 'square', .05, 110); break;
+    case 'stick': tone(340, .04, 'square', .04, 200); break;
+    case 'board': tone(140, .06, 'triangle', .08, 85); break;
+    case 'fire':  tone(180, .45, 'sawtooth', .06, 1000); tone(90, .4, 'square', .04, 320); break;
+    case 'ice':   tone(1200, .18, 'triangle', .06, 1900); tone(900, .25, 'triangle', .05, 600, .06); break;
+    case 'melt':  tone(700, .3, 'sawtooth', .04, 90); break;
+    case 'shatter': tone(1500, .12, 'triangle', .04, 400); break;
+    case 'tick':  tone(440, .09, 'square', .05); break;
+    case 'whistle': tone(1400, .35, 'sine', .06, 1550); tone(1300, .25, 'sine', .04, 1400, .1); break;
+    case 'deny':  tone(130, .16, 'square', .05, 80); break;
+    case 'ready': tone(660, .06, 'square', .04); tone(990, .1, 'square', .04, null, .07); break;
+    case 'goal':  [523, 659, 784, 1046, 784, 1046].forEach((f, i) => tone(f, .16, 'square', .06, null, i * .11)); break;
+    case 'over':  [784, 659, 523, 392].forEach((f, i) => tone(f, .22, 'square', .06, null, i * .17)); break;
+    case 'clone': tone(300, .25, 'sawtooth', .05, 80); tone(900, .2, 'triangle', .04, 300, .05); break;
+    case 'poof':  tone(240, .18, 'sawtooth', .04, 60); break;
+    case 'shield': tone(523, .12, 'triangle', .06, 1046); tone(784, .3, 'triangle', .05, 1568, .08); break;
+    case 'potion': tone(500, .12, 'sine', .05, 200); tone(260, .22, 'square', .03, 120, .08); break;
+    case 'slip':  tone(900, .25, 'sine', .04, 250); break;
+    case 'snap':  tone(700, .05, 'square', .03, 1100); break;
+    case 'shot':  tone(260, .09, 'square', .05, 120); break;
+    case 'slap':  tone(160, .18, 'sawtooth', .07, 60); tone(900, .08, 'square', .04, 300); break;
+    case 'deke':  tone(500, .09, 'triangle', .05, 1000); break;
+    case 'spin':  tone(300, .2, 'square', .04, 900); tone(900, .25, 'triangle', .04, 300, .12); break;
+    case 'whoosh': tone(600, .1, 'sine', .03, 200); break;
+    case 'ach':   [660, 880, 1100, 1320].forEach((f, i) => tone(f, .12, 'square', .05, null, i * .09)); tone(1760, .3, 'triangle', .04, 2200, .38); break;
+    case 'level': [523, 659, 784, 1046].forEach((f, i) => tone(f, .14, 'square', .06, null, i * .08)); tone(1568, .35, 'triangle', .05, 1976, .34); break;
+    case 'vs':    tone(110, .35, 'sawtooth', .07, 55); tone(330, .2, 'square', .05, 660, .12); tone(660, .3, 'square', .05, 990, .3); break;
+  }
+}
+
+/* ---------- input ---------- */
+const K = {};
+
+/* ---------- customisable controls ---------- */
+const ACTIONS = [['u', 'MOVE UP'], ['d', 'MOVE DOWN'], ['l', 'MOVE LEFT'], ['r', 'MOVE RIGHT'],
+                 ['sp', 'SPELL'], ['s', 'SHOOT (HOLD)'], ['sk', 'SKILL 2X=SPIN']];
+const DEFAULT_KEYS = [
+  { u: 'KeyW', d: 'KeyS', l: 'KeyA', r: 'KeyD', sp: 'Space', s: 'KeyE', sk: 'KeyQ' },
+  { u: 'ArrowUp', d: 'ArrowDown', l: 'ArrowLeft', r: 'ArrowRight', sp: 'Enter', s: 'Slash', sk: 'Period' }
+];
+const BIND = [Object.assign({}, DEFAULT_KEYS[0]), Object.assign({}, DEFAULT_KEYS[1])];   // live bindings (players hold these objects)
+const KEY_STORE = 'spellblade_keys_v1';
+function isReserved(c) { return !c || c === 'Escape' || c === 'Tab' || c === 'KeyP' || c === 'KeyM' || c === 'KeyF' || c === 'Unidentified' || c === 'ContextMenu' || /^F\d+$/.test(c) || /^Meta/.test(c); }
+const isMouseCode = c => /^Mouse\d$/.test(c);
+function validBinds(B) {
+  const owns = [false, false];
+  for (let i = 0; i < 2; i++) ACTIONS.forEach((a, r) => { if (isMouseCode(B[i][a[0]])) { if (r < 4) owns[i] = null; else if (owns[i] !== null) owns[i] = true; } });
+  return owns[0] !== null && owns[1] !== null && !(owns[0] && owns[1]);
+}
+function isBound(c) { return BIND.some(b => ACTIONS.some(a => b[a[0]] === c)); }
+function saveKeys() { try { localStorage.setItem(KEY_STORE, JSON.stringify(BIND)); } catch (e) {} }
+function loadKeys() {
+  try {
+    const d = JSON.parse(localStorage.getItem(KEY_STORE) || 'null');
+    if (!d || d.length !== 2) return;
+    const seen = {};
+    for (let i = 0; i < 2; i++) for (const a of ACTIONS) {
+      const v = d[i] && d[i][a[0]];
+      if (typeof v !== 'string' || isReserved(v) || seen[v]) return;     // anything odd: keep the defaults
+      seen[v] = 1;
+    }
+    if (!validBinds(d)) return;
+    for (let i = 0; i < 2; i++) for (const a of ACTIONS) BIND[i][a[0]] = d[i][a[0]];
+  } catch (e) {}
+}
+function resetKeys() {
+  Object.assign(BIND[0], DEFAULT_KEYS[0]); Object.assign(BIND[1], DEFAULT_KEYS[1]);
+  try { localStorage.removeItem(KEY_STORE); } catch (e) {}
+}
+function toast(msg) { S.toast = msg; S.toastUntil = S.t + 2; }
+// give `code` to one action; whoever had that key gets the key this action used to have (no duplicates, ever)
+function bindKey(col, row, code) {
+  if (isReserved(code)) { toast('RESERVED KEY - TRY ANOTHER'); sfx('deny'); return false; }
+  const act = ACTIONS[row][0], old = BIND[col][act];
+  if (old === code) { toast('KEY UNCHANGED'); return true; }
+  const trial = BIND.map(b => Object.assign({}, b));
+  let swapped = '';
+  for (let i = 0; i < 2; i++) for (const a of ACTIONS) {
+    if (trial[i][a[0]] === code && !(i === col && a[0] === act)) { trial[i][a[0]] = old; swapped = ' (SWAPPED)'; }
+  }
+  trial[col][act] = code;
+  if (!validBinds(trial)) {                       // mouse buttons: spell/shoot/skill only, and only one player
+    toast(isMouseCode(code) && row < 4 ? 'MOUSE: SPELL, SHOOT OR SKILL ONLY' : 'MOUSE BUTTONS: ONE PLAYER ONLY');
+    sfx('deny'); return false;
+  }
+  BIND[0] = Object.assign(BIND[0], trial[0]); BIND[1] = Object.assign(BIND[1], trial[1]); saveKeys();
+  toast(ACTIONS[row][1].split(' (')[0] + ' = ' + keyLabel(code) + swapped); sfx('ready');
+  return true;
+}
+function keyLabel(c) {
+  if (isMouseCode(c)) return ['L CLICK', 'M CLICK', 'R CLICK', 'MOUSE 4', 'MOUSE 5'][+c.slice(5)] || 'MOUSE ' + (+c.slice(5) + 1);
+  if (/^Key[A-Z]$/.test(c)) return c.slice(3);
+  if (/^Digit\d$/.test(c)) return c.slice(5);
+  if (/^Numpad\d$/.test(c)) return 'NUM ' + c.slice(6);
+  const m = { ArrowUp: 'UP', ArrowDown: 'DOWN', ArrowLeft: 'LEFT', ArrowRight: 'RIGHT', Space: 'SPACE', Enter: 'ENTER', NumpadEnter: 'ENTER',
+    Slash: '/', Period: '.', Comma: ',', Semicolon: ';', Quote: "'", BracketLeft: '[', BracketRight: ']', Backslash: '\\', Minus: '-', Equal: '=', Backquote: '`',
+    ShiftLeft: 'L SHIFT', ShiftRight: 'R SHIFT', ControlLeft: 'L CTRL', ControlRight: 'R CTRL', AltLeft: 'L ALT', AltRight: 'R ALT',
+    Backspace: 'BKSPACE', CapsLock: 'CAPS', NumpadAdd: 'NUM +', NumpadSubtract: 'NUM -', NumpadMultiply: 'NUM *', NumpadDivide: 'NUM /', NumpadDecimal: 'NUM .' };
+  return m[c] || c.toUpperCase().slice(0, 9);
+}
+function keyShort(c) { if (isMouseCode(c)) return ['LCLK', 'MCLK', 'RCLK', 'M4', 'M5'][+c.slice(5)] || 'MOUSE'; return keyLabel(c).replace(' SHIFT', 'SH').replace(' CTRL', 'CT').replace(' ALT', 'AL').slice(0, 5); }
+function moveLabel(k) {
+  if (k.u === 'ArrowUp' && k.d === 'ArrowDown' && k.l === 'ArrowLeft' && k.r === 'ArrowRight') return 'ARROWS';
+  const l = [k.u, k.l, k.d, k.r].map(keyLabel);
+  return l.every(x => x.length === 1) ? l.join('') : 'CUSTOM';
+}
+loadKeys();
+function keyName(e) {
+  if (e.code && e.code !== 'Unidentified') return e.code === 'NumpadEnter' ? 'Enter' : e.code;
+  const k = e.key || '';
+  const map = { ' ': 'Space', 'Spacebar': 'Space', 'Enter': 'Enter', 'Escape': 'Escape',
+                'ArrowUp': 'ArrowUp', 'ArrowDown': 'ArrowDown', 'ArrowLeft': 'ArrowLeft', 'ArrowRight': 'ArrowRight' };
+  if (map[k]) return map[k];
+  if (k.length === 1 && /[a-z]/i.test(k)) return 'Key' + k.toUpperCase();
+  if (/^[0-9]$/.test(k)) return 'Digit' + k;
+  const kc = { 32: 'Space', 13: 'Enter', 27: 'Escape', 37: 'ArrowLeft', 38: 'ArrowUp', 39: 'ArrowRight', 40: 'ArrowDown' }[e.keyCode];
+  return kc || k;
+}
+addEventListener('keydown', e => {
+  const c = keyName(e);
+  if (['Space', 'ArrowUp', 'ArrowDown', 'ArrowLeft', 'ArrowRight', 'Enter', 'Tab', 'Slash', 'Period'].includes(c) || isBound(c) || (S.rebind && !/^F\d+$/.test(c))) e.preventDefault();
+  try { initAudio(); } catch (err) {}
+  if (e.repeat) { K[c] = true; return; }
+  K[c] = true;
+  onPress(c);
+});
+addEventListener('keyup', e => { K[keyName(e)] = false; });
+/* click / tap the game to focus it and start (helps in embedded previews) */
+cv.addEventListener('pointerdown', e => {
+  try { cv.focus(); initAudio(); } catch (err) {}
+  const r = cv.getBoundingClientRect();
+  const x = (e.clientX - r.left) * W / r.width, y = (e.clientY - r.top) * H / r.height;
+  const mcode = 'Mouse' + e.button;
+  if (S.mode === 'title' && S.tab === 2 && S.rebind) {      // waiting for a new binding: a mouse button counts
+    const rb = S.rebind; S.rebind = null; bindKey(rb.col, rb.row, mcode); return;
+  }
+  if (S.mode === 'play') {                                  // bound mouse buttons act exactly like bound keys
+    if (isBound(mcode)) { K[mcode] = true; onPress(mcode); }
+    return;
+  }
+  if (e.button !== 0) return;                               // menus: left click only
+  if (S.mode === 'lobby') { lobbyClick(x, y); return; }
+  if (S.mode === 'title') {
+    if (y < 26) { tabClick(x, y); return; }
+    if (S.tab === 3) { achClick(x, y); return; }
+    if (S.tab === 2) { controlsClick(x, y); return; }
+    if (S.tab === 1) { fighterClick(x, y); return; }
+    for (let i = 0; i < 3; i++) {
+      if (y >= 106 + 14 * i && y < 120 + 14 * i && x > 60 && x < 420) { S.menuRow = i; changeRow(1); return; }
+    }
+    if (y >= 152 && y < 170) { if (x > 250) openLobby(); else startGame(); }
+  } else if (S.mode === 'intro') { if (S.introT > 0.5) skipIntro(); }
+  else if (S.mode === 'over') {
+    if (S.t - S.overAt >= RES_READY) { const i = btnAt(x, y); if (i === 0) rematch(); else if (i === 1) toMenu(); }
+  }
+});
+cv.addEventListener('pointermove', e => {
+  const r = cv.getBoundingClientRect();
+  S.mx = (e.clientX - r.left) * W / r.width; S.my = (e.clientY - r.top) * H / r.height;
+  if (S.mode === 'over') {
+    const i = btnAt(S.mx, S.my);
+    if (i >= 0) S.resSel = i;
+    cv.style.cursor = i >= 0 ? 'pointer' : 'default';
+  } else if (S.mode === 'title' && S.tab === 2) {
+    const h = controlsHit(S.mx, S.my);
+    if (h && !S.rebind) S.cSel = h;
+    cv.style.cursor = (S.my < 26 || h) ? 'pointer' : 'default';
+  } else if (S.mode === 'title') cv.style.cursor = (S.my < 26 || S.my > 150) ? 'pointer' : 'default';
+  else cv.style.cursor = 'default';
+});
+addEventListener('pointerup', e => { K['Mouse' + e.button] = false; });
+addEventListener('pointercancel', () => { for (let i = 0; i < 5; i++) K['Mouse' + i] = false; });
+cv.addEventListener('contextmenu', e => e.preventDefault());
+cv.addEventListener('wheel', e => { if (S.mode === 'title' && S.tab === 3) { e.preventDefault(); achScroll(e.deltaY > 0 ? 1 : -1); } }, { passive: false });
+['mousedown', 'mouseup', 'auxclick'].forEach(n => cv.addEventListener(n, e => { if (e.button > 0) e.preventDefault(); }));   // no autoscroll / back / forward
+addEventListener('blur', () => { for (const k in K) K[k] = false; if (S.mode === 'play') togglePause(); });
+addEventListener('paste', e => {
+  if (S.mode !== 'lobby' || !S.lob || S.lob.st !== 'joining') return;
+  const t = ((e.clipboardData && e.clipboardData.getData('text')) || '').toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/^SPELLBLADEHOCKEY/, '');
+  S.lob.code = (S.lob.code + t).split('').filter(ch => NET_ALPHA.includes(ch)).join('').slice(0, 5);
+});
+document.addEventListener('visibilitychange', () => { if (document.hidden && S.mode === 'play') togglePause(); });
+
+/* ---------- pixel helpers ---------- */
+function insideRink(x, y, inset = 0) {
+  const l = L + inset, r = R - inset, t = T + inset, b = B - inset, c = Math.max(0, CORNER - inset);
+  if (x < l || x > r || y < t || y > b) return false;
+  const cx = x < l + c ? l + c : x > r - c ? r - c : x;
+  const cy = y < t + c ? t + c : y > b - c ? b - c : y;
+  const dx = x - cx, dy = y - cy;
+  return dx * dx + dy * dy <= c * c;
+}
+function pxRoundRect(g, x, y, w, h, r, color) {
+  g.fillStyle = color;
+  for (let yy = 0; yy < h; yy++) {
+    let dy = 0;
+    if (yy + 0.5 < r) dy = r - (yy + 0.5);
+    else if (yy + 0.5 > h - r) dy = (yy + 0.5) - (h - r);
+    const ins = dy > 0 ? Math.round(r - Math.sqrt(Math.max(0, r * r - dy * dy))) : 0;
+    g.fillRect(x + ins, y + yy, w - 2 * ins, 1);
+  }
+}
+function pxDisc(g, cx, cy, r, color) {
+  g.fillStyle = color;
+  for (let dy = -Math.floor(r); dy <= Math.floor(r); dy++) {
+    const w = Math.floor(Math.sqrt(r * r - dy * dy));
+    g.fillRect(cx - w, cy + dy, 2 * w + 1, 1);
+  }
+}
+function pxEllipse(g, cx, cy, rx, ry, color) {
+  g.fillStyle = color;
+  for (let dy = -ry; dy <= ry; dy++) {
+    const w = Math.round(rx * Math.sqrt(Math.max(0, 1 - (dy * dy) / (ry * ry + 0.0001))));
+    g.fillRect(cx - w, cy + dy, 2 * w + 1, 1);
+  }
+}
+function pxRing(g, cx, cy, r, th, color, filter) {
+  g.fillStyle = color;
+  const R0 = r + 1;
+  for (let y = -R0; y <= R0; y++) for (let x = -R0; x <= R0; x++) {
+    const d = Math.sqrt(x * x + y * y);
+    if (d <= r + 0.3 && d >= r - th && (!filter || filter(cx + x, cy + y))) g.fillRect(cx + x, cy + y, 1, 1);
+  }
+}
+function pxLine(x0, y0, x1, y1, col) {
+  x0 = Math.round(x0); y0 = Math.round(y0); x1 = Math.round(x1); y1 = Math.round(y1);
+  const dx = Math.abs(x1 - x0), dy = -Math.abs(y1 - y0), sx = x0 < x1 ? 1 : -1, sy = y0 < y1 ? 1 : -1;
+  let err = dx + dy, guard = 80;
+  ctx.fillStyle = col;
+  while (guard-- > 0) {
+    ctx.fillRect(x0, y0, 1, 1);
+    if (x0 === x1 && y0 === y1) break;
+    const e2 = 2 * err;
+    if (e2 >= dy) { err += dy; x0 += sx; }
+    if (e2 <= dx) { err += dx; y0 += sy; }
+  }
+}
+function txt(s, x, y, size, col, align = 'left', shadow = '#14182b') {
+  ctx.font = size + 'px "Press Start 2P", monospace';
+  ctx.textBaseline = 'top';
+  ctx.textAlign = align;
+  x = Math.round(x); y = Math.round(y);
+  if (shadow) { ctx.fillStyle = shadow; const o = Math.max(1, Math.round(size / 8)); ctx.fillText(s, x + o, y + o); }
+  ctx.fillStyle = col;
+  ctx.fillText(s, x, y);
+}
+
+/* ---------- pre-rendered rink ---------- */
+let seed = 20261026;
+const srnd = () => (seed = (seed * 1664525 + 1013904223) >>> 0) / 4294967296;
+
+function buildRink() {
+  const c = document.createElement('canvas'); c.width = W; c.height = H;
+  const g = c.getContext('2d'); g.imageSmoothingEnabled = false;
+  g.fillStyle = '#0f1224'; g.fillRect(0, 0, W, H);
+
+  // crowd in the margins
+  const crowd = ['#5a3e8a', '#8a3e5a', '#3e6a8a', '#8a7a3e', '#3e8a6a', '#a0a6c8', '#c9503e'];
+  for (let y = 32; y < H; y += 4) for (let x = 0; x < W; x += 4) {
+    if (!insideRink(x + 2, y + 2, -7) && srnd() < 0.85) {
+      g.fillStyle = crowd[Math.floor(srnd() * crowd.length)];
+      g.fillRect(x + 1, y, 3, 3);
+      g.fillStyle = '#1a1f3d'; g.fillRect(x + 1, y + 3, 3, 1);
+    }
+  }
+
+  // boards (nested rounded rects)
+  pxRoundRect(g, L - 6, T - 6, R - L + 12, B - T + 12, CORNER + 6, '#14182b');
+  pxRoundRect(g, L - 5, T - 5, R - L + 10, B - T + 10, CORNER + 5, '#6f7cab');
+  pxRoundRect(g, L - 4, T - 4, R - L + 8, B - T + 8, CORNER + 4, '#c3cdee');
+  pxRoundRect(g, L - 1, T - 1, R - L + 2, B - T + 2, CORNER + 1, '#2b3158');
+
+  // ice
+  pxRoundRect(g, L, T, R - L, B - T, CORNER, '#e4f7ff');
+  for (let ty = T; ty < B; ty += 8) for (let tx = L; tx < R; tx += 8) {
+    if (((tx - L) / 8 + (ty - T) / 8) % 2 === 0 &&
+        insideRink(tx, ty) && insideRink(tx + 7, ty) && insideRink(tx, ty + 7) && insideRink(tx + 7, ty + 7)) {
+      g.fillStyle = '#ebfaff'; g.fillRect(tx, ty, 8, 8);
+    }
+  }
+  for (let i = 0; i < 260; i++) {
+    const x = Math.floor(L + srnd() * (R - L)), y = Math.floor(T + srnd() * (B - T)), len = 3 + Math.floor(srnd() * 7);
+    g.fillStyle = srnd() < 0.5 ? '#f8feff' : '#c9e8f3';
+    for (let k = 0; k < len; k++) if (insideRink(x + k, y)) g.fillRect(x + k, y, 1, 1);
+  }
+
+  const lineV = (x, w, col, dash) => {
+    for (let y = T; y < B; y++) {
+      if (insideRink(x, y) && insideRink(x + w - 1, y)) {
+        g.fillStyle = col; g.fillRect(x, y, w, 1);
+        if (dash && ((y - T) >> 2) % 3 === 1) { g.fillStyle = '#f4f1e8'; g.fillRect(x + 1, y, w - 2, 1); }
+      }
+    }
+  };
+  // centre ring + lines
+  pxRing(g, 240, CY, 30, 1.4, '#2a6fdb');
+  lineV(238, 4, '#d62839', true);
+  lineV(170, 4, '#2a6fdb', false);
+  lineV(306, 4, '#2a6fdb', false);
+  pxDisc(g, 240, CY, 3, '#2a6fdb');
+  pxDisc(g, 240, CY, 1, '#e4f7ff');
+
+  // faceoff dots
+  [[74, -56], [74, 56], [406, -56], [406, 56], [200, -56], [200, 56], [280, -56], [280, 56]].forEach(([x, dy]) => {
+    pxDisc(g, x, CY + dy, 2, '#d62839');
+  });
+  [[74, -56], [74, 56], [406, -56], [406, 56]].forEach(([x, dy]) => pxRing(g, x, CY + dy, 15, 1, '#d62839'));
+
+  // goal creases + goal lines
+  const crease = (gx, dir) => {
+    g.fillStyle = '#a8dcff';
+    for (let y = -26; y <= 26; y++) for (let x = 0; x <= 26; x++) {
+      if (x * x + y * y <= 26 * 26) g.fillRect(gx + dir * x - (dir < 0 ? 0 : 0), CY + y, 1, 1);
+    }
+    pxRing(g, gx, CY, 26, 1.3, '#d62839', (px) => dir > 0 ? px >= gx : px <= gx);
+  };
+  crease(L, 1); crease(R - 1, -1);
+  lineV(L, 2, '#d62839', false);
+  lineV(R - 2, 2, '#d62839', false);
+
+  // nets
+  const net = (x0, back) => {
+    const y0 = CY - MOUTH, hh = MOUTH * 2;
+    g.fillStyle = '#1b2040'; g.fillRect(x0, y0, NET_D, hh);
+    for (let yy = 0; yy < hh; yy++) for (let xx = 0; xx < NET_D; xx++) {
+      if (((xx + yy) & 3) === 0) { g.fillStyle = '#8d97c4'; g.fillRect(x0 + xx, y0 + yy, 1, 1); }
+    }
+    g.fillStyle = '#f2f2f2'; g.fillRect(back, y0 - 2, 2, hh + 4);
+    g.fillStyle = '#d62839';
+    g.fillRect(x0, y0 - 2, NET_D, 2); g.fillRect(x0, y0 + hh, NET_D, 2);
+  };
+  net(L - NET_D, L - NET_D);
+  net(R, R + NET_D - 2);
+  [[L, CY - MOUTH], [L, CY + MOUTH], [R, CY - MOUTH], [R, CY + MOUTH]].forEach(([x, y]) => {
+    g.fillStyle = '#14182b'; g.fillRect(x - 3, y - 3, 6, 6);
+    g.fillStyle = '#f4f1e8'; g.fillRect(x - 2, y - 2, 4, 4);
+    g.fillStyle = '#d62839'; g.fillRect(x - 1, y - 1, 2, 2);
+  });
+  return c;
+}
+const rinkLayer = buildRink();
+
+/* ---------- characters ---------- */
+const CH = [
+  { key: 'pyro', name: 'PYROMANCER', short: 'PYRO', spell: 'fire', spellName: 'FIREBALL',
+    spd: 1.0, mass: 1.0, check: 1.0, spdPips: 3, chkPips: 3, powPips: 5, regenPips: 3, col: '#ff7a59',
+    tag: 'BALANCED SHOOTER', l1: 'LAUNCH THE PUCK AT SUPER', l2: 'SPEED. NEEDS PUCK CLOSE.',
+    mana: ['#c1121f', '#e63c1f', '#ff8a1f', '#ffd23f'] },
+  { key: 'frost', name: 'FROST MAGE', short: 'FROST', spell: 'ice', spellName: 'ICE WALL',
+    spd: 1.0, mass: 1.0, check: 1.0, spdPips: 3, chkPips: 3, powPips: 3, regenPips: 4, col: '#8fd3ff',
+    tag: 'BALANCED DEFENDER', l1: 'WALL BLOCKS SHOTS 3 SECS', l2: 'FIREBALLS MELT IT.',
+    mana: ['#2a6fdb', '#3d8fe0', '#8fd3ff', '#e6fbff'] },
+  { key: 'ninja', name: 'SHADOW NINJA', short: 'NINJA', spell: 'clone', spellName: 'SHADOW CLONE',
+    spd: 1.28, mass: 0.85, check: 0.8, spdPips: 5, chkPips: 2, powPips: 2, regenPips: 3, col: '#c9a6ff',
+    tag: 'HIGH MOVEMENT SPEED', l1: 'FAKE PUCK TRICKS THE', l2: 'GOALIE FOR 3 SECS.',
+    mana: ['#3a1d6e', '#6a3fb5', '#a67cff', '#e2d1ff'] },
+  { key: 'paladin', name: 'PALADIN GUARD', short: 'PALADIN', spell: 'shield', spellName: 'HOLY SHIELD',
+    spd: 0.84, mass: 1.8, check: 2.2, spdPips: 2, chkPips: 5, powPips: 4, regenPips: 2, col: '#ffd23f',
+    tag: 'SLOW BUT HEAVY CHECKS', l1: 'IMMUNE TO CHECKS AND', l2: 'STUNS FOR 4 SECS.',
+    mana: ['#8a6a10', '#c9a227', '#ffd23f', '#fff3a0'] },
+  { key: 'alch', name: 'ALCHEMIST', short: 'ALCHEMIST', spell: 'potion', spellName: 'POTION TOSS',
+    spd: 1.0, mass: 1.0, check: 1.0, spdPips: 3, chkPips: 3, powPips: 4, regenPips: 4, col: '#7be08a',
+    tag: 'BALANCED STATS', l1: 'DROPS A SLICK OIL PUDDLE', l2: 'THAT MAKES FOES SLIDE.',
+    mana: ['#1f6b3a', '#2f9e55', '#7be08a', '#d2ffd8'] }
+];
+
+// Shot Power scales stick-shot speed; Mana Regen scales how fast the spell bar refills (3 pips = 1.0x)
+const powMul = c => 1 + 0.06 * (c.powPips - 3), regenMul = c => 1 + 0.08 * (c.regenPips - 3);
+
+/* ---------- sprites ---------- */
+const HEADS = {
+  pyro:    ['.....k.....', '....kHk....', '...kHhhk...', '..kHhhhhk..', '.kkkkkkkkk.', '..ksssssk..', '..ksssksk..', '...ksssk...'],
+  frost:   ['.....w.....', '....kHk....', '...kHhhk...', '..kHhhhhk..', '.kwwwwwwwk.', '..ksssssk..', '..ksssksk..', '...ksssk...'],
+  ninja:   ['...kkkkk...', '..khhhhhk..', '.khhhhhhhk.', '.krrrrrrrk.', '.khhhhhhhk.', '..kswkwsk..', '..khhhhhk..', '...khhhk...'],
+  paladin: ['....kgk....', '...kgggk...', '..kHhhhhk..', '.kHhhhhhhk.', '.kkkkkkkkk.', '..kgsssgk..', '..ksssksk..', '...ksssk...'],
+  alch:    ['....kkk....', '...khhhk...', '..khHhhhk..', '.kkkkkkkkk.', '.kyykkkyyk.', '..ksssssk..', '..ksssksk..', '...ksssk...']
+};
+const BODY = ['.kjjjjjjjk.', '.kjwwwwwjk.', '.kjjjjjjjk.', '..kpppppk..'];
+const BASE = HEADS.pyro.concat(BODY);
+const LEGS_A = ['..kpk.kpk..', '..kkk.kkk..', '.bbbbb.bbbb'];
+const LEGS_B = ['.kpk...kpk.', '.kkk...kkk.', 'bbbb...bbbb'];
+const COMMON = { k: '#14182b', s: '#f6c89f', w: '#f4f1e8', p: '#2b2d42', b: '#cfd8e3' };
+const JERSEY = ['#d62839', '#2a6fdb'];
+const CHPAL = {
+  pyro:    { h: '#c1121f', H: '#ff7a59' },
+  frost:   { h: '#1d4fa8', H: '#8fd3ff' },
+  ninja:   { h: '#2b2d42', H: '#3d4066' },
+  paladin: { h: '#aab4d4', H: '#e6ebff', g: '#ffd23f' },
+  alch:    { h: '#2f8f4e', H: '#7be08a', y: '#9bf28a' }
+};
+function makeSpr(pal, legB, head) {
+  const c = document.createElement('canvas'); c.width = 11; c.height = 15;
+  const g = c.getContext('2d');
+  (head || HEADS.pyro).concat(BODY, legB ? LEGS_B : LEGS_A).forEach((row, y) => {
+    for (let x = 0; x < 11; x++) { const ch = row[x]; if (ch !== '.') { g.fillStyle = pal[ch]; g.fillRect(x, y, 1, 1); } }
+  });
+  return c;
+}
+const GPAL = [
+  Object.assign({ j: '#d62839', h: '#8e9bc9', H: '#e6ebff' }, COMMON),
+  Object.assign({ j: '#2a6fdb', h: '#8e9bc9', H: '#e6ebff' }, COMMON)
+];
+// SPR[character][team][animation frame]
+const SPR = CH.map(c => [0, 1].map(t => {
+  const pal = Object.assign({ j: JERSEY[t], r: JERSEY[t] }, COMMON, CHPAL[c.key]);
+  return [makeSpr(pal, false, HEADS[c.key]), makeSpr(pal, true, HEADS[c.key])];
+}));
+const GSPR = GPAL.map(p => makeSpr(p, false));
+
+function blit(c, x, y, flip, scale = 1) {
+  const w = c.width * scale, h = c.height * scale;
+  if (flip) { ctx.save(); ctx.translate(x + w, y); ctx.scale(-1, 1); ctx.drawImage(c, 0, 0, w, h); ctx.restore(); }
+  else ctx.drawImage(c, x, y, w, h);
+}
+
+/* ---------- game state ---------- */
+const S = { mode: 'title', prev: 'title', t: 0, time: MATCH_TIME, score: [0, 0], ot: false,
+            cd: 0, goalT: 0, goalBy: 0, shake: 0, flash: 0, goBanner: 0, overAt: 0, winner: -1,
+            menuRow: 0, cpu: true, cpuId: 1, level: 1,
+            chars: [0, 1], tab: 0, fAct: 0, introT: 0 };
+// online session (peer-to-peer): role is 'host' (runs the match, plays RED) or 'guest' (sends controls, plays BLUE)
+const NET = { role: null, me: 0, peer: null, conn: null, inMatch: false, ev: [], sAcc: 0, inT: 0, lastRx: 0,
+              inp: { ix: 0, iy: 0, sh: false }, peerChar: 0, myPick: 0, saved: null, rem: false };
+const isMe = id => !NET.role || id === NET.me;
+let acc = 0;
+const particles = [], texts = [];
+let walls = [], decoys = [], puddles = [];
+
+/* ---------- match statistics ---------- */
+function mkStats() { return { shots: 0, onGoal: 0, goals: 0, saves: 0, spells: 0, hits: 0, skills: 0, blocks: 0, slips: 0, steals: 0 }; }
+const stats = [mkStats(), mkStats()];
+function stat(id, k) { if (S.mode === 'play') stats[id][k]++; }
+// A "shot" is a real strike (stick or Fireball) heading at the other net; "on goal" if it would cross the goal mouth.
+function registerShot(p, any) {
+  if (S.mode !== 'play' || S.t - (p.shotAt || -9) < 0.6) return;
+  const dir = p.id === 0 ? 1 : -1, goalX = p.id === 0 ? R : L;
+  const sp = Math.hypot(puck.vx, puck.vy);
+  if (sp < 150 || puck.vx * dir <= 0 || Math.abs(puck.vx) < sp * 0.35) return;
+  if (!any && Math.abs(goalX - puck.x) > 250) return;
+  const yAt = puck.y + puck.vy * (goalX - puck.x) / puck.vx;
+  if (Math.abs(yAt - CY) > 95) return;
+  p.shotAt = S.t;
+  const on = Math.abs(yAt - CY) < MOUTH + 3;
+  stats[p.id].shots++;                       // 'on goal' is counted when the shot ends as a goal or a save
+  puck.shotTeam = p.id; puck.shotOn = on; puck.shotT = S.t;
+}
+
+function mkPlayer(id) {
+  return { kind: 'p', id, x: 0, y: 0, vx: 0, vy: 0, ang: id ? Math.PI : 0, face: id ? -1 : 1,
+           char: id ? 1 : 0, shield: 0, oil: 0, chkCd: 0, slipDir: 1,
+           mana: 0.3, stun: 0, bx: 0, by: 0, bvx: 0, bvy: 0, anim: 0, noPuck: 0, wasFull: false,
+           charge: 0, wasHeld: false, snapCd: 0, holdT: 0, dekeT: 0, dodge: 0, dodgeTxt: 0, dekeCd: 0,
+           spinT: 0, spinCd: 0, spin0: 0, spinDir: 1, lastTap: -9, side: 1, dkx: 0, dky: 0, inx: 0, iny: 0,
+           aiShoot: false, aiShooting: false, aiChgT: 0, carryT: 0,
+           k: BIND[id] };
+}
+const P = [mkPlayer(0), mkPlayer(1)];
+const G = [
+  { kind: 'g', team: 0, x: L + 11, y: CY, vy: 0, stun: 0 },
+  { kind: 'g', team: 1, x: R - 11, y: CY, vy: 0, stun: 0 }
+];
+const puck = { x: 240, y: CY, vx: 0, vy: 0, r: 3.2, fire: false, owner: -1, ignT: 0, carrier: -1, snapT: 0, snipe: -1, snipeT: 0 };
+
+function resetPositions() {
+  P.forEach((p, i) => {
+    p.x = i ? R - 100 : L + 100; p.y = CY; p.vx = p.vy = 0;
+    p.ang = i ? Math.PI : 0; p.face = i ? -1 : 1; p.stun = 0; p.shield = 0; p.oil = 0; p.chkCd = 0;
+    p.charge = 0; p.wasHeld = false; p.snapCd = 0; p.holdT = 0; p.dekeT = 0; p.dodge = 0; p.dekeCd = 0; p.spinT = 0; p.spinCd = 0;
+    p.aiShoot = false; p.aiShooting = false; p.carryT = 0; p.lastTap = -9;
+    p.bx = p.x + Math.cos(p.ang) * BL; p.by = p.y + 3 + Math.sin(p.ang) * BL * 0.8; p.bvx = p.bvy = 0;
+  });
+  puck.x = 240; puck.y = CY; puck.vx = puck.vy = 0; puck.fire = false; puck.ignT = 0; puck.owner = -1; puck.shotOn = false; puck.carrier = -1; puck.snapT = 0; puck.snipe = -1;
+  G.forEach(g => { g.y = CY; g.vy = 0; g.stun = 0; });
+  walls.length = 0; decoys.length = 0; puddles.length = 0;
+}
+function startGame() {
+  sanitizeChars();
+  S.score = [0, 0]; S.time = MATCH_TIME; S.ot = false; S.otT = 0; S.winner = -1;
+  P.forEach(p => {
+    p.mana = 0.3; p.noPuck = 0; p.wasFull = false;
+    p.cpu = S.cpu && p.id === S.cpuId;
+    p.char = S.chars[p.id];
+    p.spd = (p.cpu ? DIFF[S.level].spd : 1) * CH[p.char].spd;
+    p.aiIx = 0; p.aiIy = 0; p.aiT = 0; p.aiCd = 0; p.aiFireT = 0; p.stuckT = 0;
+    p.aiAimY = CY; p.aiTx = p.x; p.aiTy = p.y;
+  });
+  particles.length = 0; texts.length = 0;
+  resetPositions();
+  stats[0] = mkStats(); stats[1] = mkStats(); puck.shotOn = false; S.resSel = 0; S.def = [0, 0];
+  S.cd = 2.4; S.mode = 'intro'; S.introT = 0;
+  sfx('vs');
+  if (NET.role === 'host') { S.remReq = false; NET.sAcc = 1; NET.lastRx = performance.now(); netSend({ t: 'start', chars: S.chars.slice() }); }
+}
+function skipIntro() { S.mode = 'countdown'; S.cd = 2.4; sfx('tick'); }
+function togglePause() {
+  if (NET.role) return;                                    // an online match can't be paused
+  P.forEach(p => { p.charge = 0; p.wasHeld = false; });
+  if (S.mode === 'paused') { S.mode = S.prev; }
+  else if (S.mode === 'play' || S.mode === 'countdown' || S.mode === 'goal') { S.prev = S.mode; S.mode = 'paused'; }
+}
+function humanId() { return 1 - S.cpuId; }
+const fcur = id => (S.fCur && S.fCur[id] != null) ? S.fCur[id] : S.chars[id];
+// the cursor can rest on a locked fighter (to read its card) but only an unlocked one becomes your pick
+function pickCur(id) {
+  const c = S.fCur[id];
+  if (isLocked(id, c)) { toast('LOCKED - REACH LEVEL ' + UNLOCK_LEVEL[c] + ' TO UNLOCK'); sfx('deny'); }
+  else { S.chars[id] = c; sfx('tick'); }
+}
+function cycleChar(id, d) { S.fCur = S.fCur || S.chars.slice(); S.fCur[id] = (fcur(id) + d + CH.length) % CH.length; pickCur(id); }
+function setTab(t) { S.tab = t; S.rebind = null; if (t === 1) { sanitizeChars(); S.fCur = S.chars.slice(); if (S.cpu) S.fAct = humanId(); } sfx('tick'); }
+function fighterPress(c) {
+  const left = c === 'KeyA' || c === 'ArrowLeft', right = c === 'KeyD' || c === 'ArrowRight';
+  if (S.cpu) {
+    const id = S.fAct;
+    if (c === 'ArrowUp' || c === 'ArrowDown' || c === 'KeyW' || c === 'KeyS') { S.fAct = 1 - S.fAct; sfx('tick'); }
+    else if (left) cycleChar(id, -1);
+    else if (right) cycleChar(id, 1);
+    else if (c === 'KeyR') { const ok = CH.map((x, i) => i).filter(i => !isLocked(id, i)); S.chars[id] = pick(ok); S.fCur = S.fCur || S.chars.slice(); S.fCur[id] = S.chars[id]; sfx('tick'); }
+  } else {
+    if (c === 'KeyA') cycleChar(0, -1);
+    else if (c === 'KeyD') cycleChar(0, 1);
+    else if (c === 'ArrowLeft') cycleChar(1, -1);
+    else if (c === 'ArrowRight') cycleChar(1, 1);
+  }
+}
+function fighterClick(x, y) {
+  for (let id = 0; id < 2; id++) {
+    const px = id ? 244 : 10;
+    if (y >= 52 && y < 90 && x >= px + 8 && x < px + 218) {
+      const i = Math.floor((x - px - 8) / 42);
+      if (i < 0 || i >= CH.length) return;
+      S.fCur = S.fCur || S.chars.slice(); S.fCur[id] = i; if (S.cpu) S.fAct = id; pickCur(id);
+      return;
+    }
+  }
+}
+const cs = () => S.cSel || (S.cSel = { col: 0, row: 0 });
+function controlsHit(x, y) {
+  for (let col = 0; col < 2; col++) {
+    const px = col ? 244 : 10;
+    for (let i = 0; i < ACTIONS.length; i++) {
+      const ry = 54 + 18 * i;
+      if (x >= px + 8 && x < px + 218 && y >= ry - 2 && y < ry + 16) return { col, row: i };
+    }
+  }
+  if (x >= 148 && x < 332 && y >= 190 && y < 216) return { col: 0, row: 7 };
+  return null;
+}
+function doReset() { resetKeys(); S.rebind = null; toast('CONTROLS RESET TO DEFAULT!'); sfx('goal'); }
+function controlsClick(x, y) {
+  const h = controlsHit(x, y);
+  if (!h) { S.rebind = null; return; }
+  S.cSel = h;
+  if (h.row === 7) doReset(); else { S.rebind = { col: h.col, row: h.row }; sfx('tick'); }
+}
+function controlsPress(c) {
+  if (S.rebind) {                                           // waiting for the new key
+    if (c === 'Escape') { S.rebind = null; sfx('tick'); return; }
+    const r = S.rebind; S.rebind = null; bindKey(r.col, r.row, c); return;
+  }
+  const sel = cs();
+  if (c === 'Tab') { setTab((S.tab + 1) % 4); return; }
+  if (c === 'Escape') { setTab(0); return; }
+  if (c === 'KeyM') { muted = !muted; return; }
+  if (c === 'KeyF') { toggleFullscreen(); return; }
+  if (c === 'KeyR') { doReset(); return; }
+  if (c === 'ArrowUp') { sel.row = (sel.row + 7) % 8; sfx('tick'); }
+  else if (c === 'ArrowDown') { sel.row = (sel.row + 1) % 8; sfx('tick'); }
+  else if (c === 'ArrowLeft' || c === 'ArrowRight') { if (sel.row < 7) { sel.col = 1 - sel.col; sfx('tick'); } }
+  else if (c === 'Enter' || c === 'Space') { if (sel.row === 7) doReset(); else { S.rebind = { col: sel.col, row: sel.row }; sfx('tick'); } }
+}
+function tabClick(x, y) {
+  if (y < 2 || y >= 25) return;
+  if (x >= 20 && x < 116) { if (S.tab !== 0) setTab(0); }
+  else if (x >= 120 && x < 216) { if (S.tab !== 1) setTab(1); }
+  else if (x >= 220 && x < 316) { if (S.tab !== 2) setTab(2); }
+  else if (x >= 320 && x < 416) { if (S.tab !== 3) setTab(3); }
+}
+function toMenu(tab) {
+  if (NET.role) netClose();
+  S.mode = 'title'; S.tab = tab || 0; S.rebind = null; sanitizeChars(); S.fCur = S.chars.slice(); S.score = [0, 0]; S.time = MATCH_TIME; S.ot = false; S.winner = -1;
+  if (S.tab === 1 && S.cpu) S.fAct = humanId();
+  particles.length = 0; texts.length = 0;
+  P.forEach(p => { p.char = S.chars[p.id]; });
+  resetPositions();
+}
+function changeRow(d) {
+  if (S.menuRow === 0) S.cpu = !S.cpu;
+  else if (S.menuRow === 1) S.cpuId = 1 - S.cpuId;
+  else S.level = (S.level + d + 3) % 3;
+  sanitizeChars();
+  sfx('tick');
+}
+function onPress(c) {
+  if (S.mode === 'lobby' && S.lob && S.lob.st === 'joining') { lobbyPress(c); return; }      // typing a room code: every letter counts
+  if (S.mode === 'title' && S.tab === 2) { controlsPress(c); return; }
+  if (c === 'KeyM') { muted = !muted; return; }
+  if (c === 'KeyF') { toggleFullscreen(); return; }
+  if (S.mode === 'lobby') { lobbyPress(c); return; }
+  if (NET.role === 'guest' && NET.inMatch) { guestPress(c); return; }
+  if (S.mode === 'intro') {
+    if (c === 'Escape') toMenu();
+    else if (S.introT > 0.5 && (c === 'Space' || c === 'Enter')) skipIntro();
+    return;
+  }
+  if (S.mode === 'title') {
+    if (c === 'Tab') { setTab((S.tab + 1) % 4); return; }
+    if (c === 'Escape') { if (S.tab !== 0) setTab(0); return; }
+    if (c === 'Space' || c === 'Enter') { startGame(); return; }
+    if (c === 'KeyO' && S.tab === 0) { openLobby(); return; }
+    if (c === 'Digit1' || c === 'Numpad1') { S.cpu = true; startGame(); return; }
+    if (c === 'Digit2' || c === 'Numpad2') { S.cpu = false; startGame(); return; }
+    if (S.tab === 1) { fighterPress(c); return; }
+    if (S.tab === 3) {
+      if (c === 'ArrowUp' || c === 'KeyW') achScroll(-1);
+      else if (c === 'ArrowDown' || c === 'KeyS') achScroll(1);
+      return;
+    }
+    if (c === 'ArrowUp' || c === 'KeyW') { S.menuRow = (S.menuRow + 2) % 3; sfx('tick'); }
+    else if (c === 'ArrowDown' || c === 'KeyS') { S.menuRow = (S.menuRow + 1) % 3; sfx('tick'); }
+    else if (c === 'ArrowLeft' || c === 'KeyA') changeRow(-1);
+    else if (c === 'ArrowRight' || c === 'KeyD') changeRow(1);
+    return;
+  }
+  if (S.mode === 'paused' && c === 'KeyQ') { toMenu(); return; }
+  if (S.mode === 'over' && c === 'Escape') { toMenu(); return; }
+  if (c === 'KeyP' || c === 'Escape') { togglePause(); return; }
+  if (S.mode === 'over') {
+    if (S.t - S.overAt >= RES_READY) {
+      if (c === 'KeyC') toMenu(1);
+      else if (c === 'KeyR') rematch();
+      else if (c === 'ArrowLeft' || c === 'ArrowRight' || c === 'KeyA' || c === 'KeyD') { S.resSel = 1 - S.resSel; sfx('tick'); }
+      else if (c === 'Space' || c === 'Enter') { if (S.resSel === 0) rematch(); else toMenu(); }
+    }
+    return;
+  }
+  if (S.mode === 'play') {
+    const ids = NET.role ? [0] : (S.cpu ? [1 - S.cpuId] : [0, 1]);
+    for (const id of ids) {
+      const sets = (S.cpu || NET.role) ? [BIND[0], BIND[1]] : [BIND[id]];       // in 1P mode either key set drives you
+      if (sets.some(k => k.sp === c)) castSpell(P[id]);
+      if (sets.some(k => k.sk === c)) useSkill(P[id]);
+    }
+  }
+}
+
+/* ---------- achievements & badges ---------- */
+const ACH = [
+  { id: 'first',   name: 'FIRST BLOOD',   desc: 'SCORE YOUR FIRST GOAL' },
+  { id: 'hat',     name: 'HAT TRICK',     desc: 'SCORE 3 GOALS IN ONE MATCH' },
+  { id: 'sniper',  name: 'SNIPER',        desc: 'SCORE A FULL-CHARGE SHOT FROM YOUR OWN HALF' },
+  { id: 'spell',   name: 'SPELL MASTER',  desc: 'CAST 5 SPELLS IN ONE GAME' },
+  { id: 'ankle',   name: 'ANKLE BREAKER', desc: 'DO 3 DEKES OR SPINS IN ONE MATCH' },
+  { id: 'brick',   name: 'BRICK WALL',    desc: '5 SAVES OR 3 ICE WALL BLOCKS IN A GAME' },
+  { id: 'shut',    name: 'SHUTOUT',       desc: 'WIN A MATCH WITHOUT CONCEDING A GOAL' },
+  { id: 'fire',    name: 'FIRESTARTER',   desc: 'SCORE A GOAL WITH A FIREBALL' },
+  { id: 'hit',     name: 'HEAVY HITTER',  desc: 'LAND 5 HITS OR CHECKS IN ONE MATCH' },
+  { id: 'comeback', name: 'COMEBACK KID', desc: 'WIN AFTER TRAILING BY 2 OR MORE GOALS' },
+  { id: 'buzzer',  name: 'BUZZER BEATER', desc: 'SCORE IN THE FINAL 5 SECONDS' },
+  { id: 'sudden',  name: 'SUDDEN DEATH',  desc: 'SCORE THE OVERTIME WINNER' },
+  { id: 'quick',   name: 'QUICK DRAW',    desc: 'SCORE WITHIN 10 SECONDS OF THE FACE-OFF' },
+  { id: 'mind',    name: 'MIND GAMES',    desc: 'FOOL THE GOALIE WITH A SHADOW CLONE' },
+  { id: 'slip',    name: 'SLIPPERY SLOPE', desc: 'MAKE THE FOE SLIP ON OIL 3X IN A MATCH' },
+  { id: 'thief',   name: 'PUCK THIEF',    desc: 'STRIP THE PUCK 3 TIMES IN ONE MATCH' },
+  { id: 'regular', name: 'REGULAR',       desc: 'PLAY 10 MATCHES', prog: () => Math.min(LIFE.matches, 10) + '/10' },
+  { id: 'machine', name: 'GOAL MACHINE',  desc: 'SCORE 25 GOALS IN TOTAL', prog: () => Math.min(LIFE.goals, 25) + '/25' }
+];
+const ACH_ID = { shutout: 'shut' };                     // alias used by endGame
+const ACH_ICONS = {"first": {"rows": [".....KK.....", "....KRRK....", "....KRRK....", "...KRRRRK...", "...KRRRRK...", "..KRRWRRRK..", "..KRWRRRRK..", "..KRRRRRRK..", "..KRRRRRDK..", "...KRRRDK...", "....KKKK....", "............"], "pal": {"K": "#14182b", "R": "#ff4a5a", "D": "#a31526", "W": "#ffd0d0"}}, "hat": {"rows": ["............", "...PPPPPP...", "...PHHPPP...", "...PHPPPP...", "...PPPPPP...", "...PPPPPP...", "...GGGGGG...", "...PPPPPP...", "..PPPPPPPP..", ".PPPPPPPPPP.", "PPPPPPPPPPPP", "............"], "pal": {"P": "#8d5cf0", "H": "#c9b0ff", "G": "#ffd23f"}}, "sniper": {"rows": [".....RR.....", "...RRRRRR...", "..RR.RR.RR..", ".RR..RR..RR.", ".R...RR...R.", "RRRR.WW.RRRR", "RRRR.WW.RRRR", ".R...RR...R.", ".RR..RR..RR.", "..RR.RR.RR..", "...RRRRRR...", ".....RR....."], "pal": {"R": "#ff5a5f", "W": "#ffffff"}}, "spell": {"rows": [".....GG.....", ".....GG.....", "....GYYG....", "....GYYG....", "GGGGGYYGGGGG", ".GYYYYYYYYG.", "..GYYYYYYG..", "...GYYYYG...", "...GYYYYG...", "..GYYGGYYG..", "..GGG..GGG..", ".GG......GG."], "pal": {"G": "#ffb100", "Y": "#fff3a0"}}, "ankle": {"rows": ["...WWWW.....", "...WWWW.....", "...WWWW.....", "...WWWW.....", "...WWWWW....", "...WWWWWWW..", "..WWWWWWWWW.", "..WWWWWWWWW.", "..BBBBBBBBB.", ".SSSSSSSSSSS", "..S.......S.", "............"], "pal": {"W": "#f4f1e8", "B": "#8b93b8", "S": "#8fd3ff"}}, "brick": {"rows": ["MMMMMMMMMMMM", "RRRRMRRRRMRR", "RRRRMRRRRMRR", "MMMMMMMMMMMM", "RRMRRRRMRRRR", "RRMRRRRMRRRR", "MMMMMMMMMMMM", "RRRRMRRRRMRR", "RRRRMRRRRMRR", "MMMMMMMMMMMM", "RRMRRRRMRRRR", "RRMRRRRMRRRR"], "pal": {"M": "#c9c9d6", "R": "#e0804f"}}, "shut": {"rows": [".DDDDDDDDDD.", "DSSSSSSSSSSD", "DSSWWSSSSSSD", "DSSWSSSSSSSD", "DSSSSSSSSSSD", "DSSSSSSSSSSD", ".DSSSSSSSSD.", ".DSSSSSSSSD.", "..DSSSSSSD..", "...DSSSSD...", "....DSSD....", ".....DD....."], "pal": {"D": "#2a6fdb", "S": "#8fd3ff", "W": "#ffffff"}}};
+Object.assign(ACH_ICONS, {"fire": {"rows": [".....R......", "....RR......", "....RRR..R..", "...RRRRR.RR.", "..RRRORRRRR.", "..RRROORRRR.", ".RRROOOORRR.", ".RROOOYOORR.", ".RROOYYOORR.", ".RROOYYOORR.", "..RROOOORR..", "...RRRRRR..."], "pal": {"R": "#ff5a1f", "O": "#ffb100", "Y": "#fff3a0"}}, "hit": {"rows": [".....YY.....", "Y....YY....Y", ".Y...YY...Y.", "..Y..WW..Y..", "...YYWWYY...", "YYYWWWWWWYYY", "YYYWWWWWWYYY", "...YYWWYY...", "..Y..WW..Y..", ".Y...YY...Y.", "Y....YY....Y", ".....YY....."], "pal": {"Y": "#ffd23f", "W": "#ffffff"}}, "comeback": {"rows": [".....GG.....", "....GGGG....", "...GGGGGG...", "..GGGGGGGG..", ".GGGGGGGGGG.", "....GGGG....", "....GGGG....", "....GDDG....", "....GDDG....", "....GDDG....", "....DDDD....", "............"], "pal": {"G": "#7be08a", "D": "#2f9e55"}}, "buzzer": {"rows": ["...KKKKKK...", "..KWWWWWWK..", ".KWWWRWWWWK.", "KWWWWRWWWWWK", "KWWWWRWWWWWK", "KWWWWRRRWWWK", "KWWWWWWWWWWK", "KWWWWWWWWWWK", ".KWWWWWWWWK.", "..KWWWWWWK..", "...KKKKKK...", "............"], "pal": {"K": "#8b93b8", "W": "#f4f1e8", "R": "#ff5a5f"}}, "sudden": {"rows": ["...WWWWWW...", "..WWWWWWWW..", ".WWWWWWWWWW.", ".WWKKWWKKWW.", ".WWKKWWKKWW.", ".WWWWWWWWWW.", "..WWWKKWWW..", "...WWWWWW...", "...WKWKWKW..", "...WWWWWW...", "............", "............"], "pal": {"W": "#e4f7ff", "K": "#14182b"}}, "quick": {"rows": [".......YYY..", "......YYY...", ".....YYY....", "....YYY.....", "...YYYYYYY..", "..YYYYYYY...", "......YYY...", ".....YYO....", ".....YO.....", "....YO......", "...YO.......", "..O........."], "pal": {"Y": "#ffd23f", "O": "#ffb100"}}, "mind": {"rows": ["....PPPP....", "...PPPPPP...", "..PPPPPPPP..", "..PKKPPKKP..", "..PKKPPKKP..", "..PPPPPPPP..", "..PPPPPPPP..", "..PPPPPPPP..", "..PPPPPPPP..", "..PP.PP.PP..", "..P...PP..P.", "............"], "pal": {"P": "#a67cff", "K": "#14182b"}}, "slip": {"rows": ["....BBBB....", "....BBBB....", ".....WW.....", ".....WW.....", "....WWWW....", "...WWGGWW...", "..WWGGGGWW..", "..WGGGGGGW..", "..WGGGDGGW..", "..WGGDDDGW..", "..WWGGGGWW..", "...WWWWWW..."], "pal": {"B": "#8b93b8", "W": "#d2f0ff", "G": "#7be08a", "D": "#2f9e55"}}, "thief": {"rows": ["............", "..Y......Y..", "...KKKKKK...", "..KSSSSSSK..", ".KSWWSSSSSK.", ".KSWSSSSSSK.", ".KSSSSSSSSK.", ".KKKKKKKKKK.", ".KSSSSSSSSK.", "..KKKKKKKK..", "..Y......Y..", "............"], "pal": {"K": "#14182b", "S": "#8b93b8", "W": "#ffffff", "Y": "#fff3a0"}}, "regular": {"rows": ["..BB....RR..", "...BB..RR...", "....BBRR....", "....BBRR....", "...OOOOOO...", "..OGGGGGGO..", "..OGGYYGGO..", "..OGGYYGGO..", "..OGGGGGGO..", "..OGGGGGGO..", "...OOOOOO...", "............"], "pal": {"B": "#2a6fdb", "R": "#d62839", "O": "#c9a227", "G": "#ffd23f", "Y": "#fff3a0"}}, "machine": {"rows": ["..GGGGGGGG..", "GGGYYGGGGGGG", "G.GYYGGGGG.G", "G.GGGGGGGG.G", ".GGGGGGGGGG.", "...GGGGGG...", "....GGGG....", ".....GG.....", ".....GG.....", "....OOOO....", "...OOOOOO...", "...OOOOOO..."], "pal": {"G": "#ffd23f", "Y": "#fff3a0", "O": "#c9a227"}}});
+const ACH_KEY = 'spellblade_ach_v1';
+const LIFE_KEY = 'spellblade_life_v1';
+let LIFE = { matches: 0, goals: 0 };
+try { const d = JSON.parse(localStorage.getItem(LIFE_KEY) || '{}'); if (d && d.matches > 0) LIFE.matches = d.matches | 0; if (d && d.goals > 0) LIFE.goals = d.goals | 0; } catch (e) {}
+function saveLife() { try { localStorage.setItem(LIFE_KEY, JSON.stringify(LIFE)); } catch (e) {} }
+
+/* ---------- player level & fighter unlocks ---------- */
+const LEVEL_CAP = 20;
+const UNLOCK_LEVEL = [1, 1, 3, 5, 8];                  // Pyromancer, Frost Mage, Shadow Ninja, Paladin Guard, Alchemist
+const PROFILE_KEY = 'spellblade_profile_v1';
+const xpCost = l => 80 + 40 * l;                        // XP needed to climb from level l to l+1
+const totalXpAt = l => { let t = 0; for (let i = 1; i < l; i++) t += xpCost(i); return t; };
+function levelInfo(total) {
+  let l = 1, x = Math.max(0, Math.floor(total) || 0);
+  while (l < LEVEL_CAP && x >= xpCost(l)) { x -= xpCost(l); l++; }
+  return { level: l, into: l >= LEVEL_CAP ? 0 : x, need: l >= LEVEL_CAP ? 0 : xpCost(l) };
+}
+const PROFILE = { xp: 0, level: 1, unlocked: CH.map((c, i) => UNLOCK_LEVEL[i] <= 1) };
+function saveProfile() { try { localStorage.setItem(PROFILE_KEY, JSON.stringify(PROFILE)); } catch (e) {} }
+(function loadProfile() {
+  let d = null;
+  try { d = JSON.parse(localStorage.getItem(PROFILE_KEY) || 'null'); } catch (e) {}
+  if (d && typeof d.xp === 'number' && d.xp >= 0 && isFinite(d.xp)) PROFILE.xp = Math.floor(d.xp);
+  PROFILE.level = levelInfo(PROFILE.xp).level;
+  CH.forEach((c, i) => { PROFILE.unlocked[i] = !!(d && d.unlocked && d.unlocked[i]) || UNLOCK_LEVEL[i] <= PROFILE.level; });
+})();
+const isHumanSlot = id => !(S.cpu && id === S.cpuId);
+const isLocked = (id, c) => isHumanSlot(id) && !PROFILE.unlocked[c];          // the CPU may use any fighter
+const firstOpen = () => Math.max(0, PROFILE.unlocked.indexOf(true));
+function sanitizeChars() { if (NET.role) return; for (let id = 0; id < 2; id++) if (isLocked(id, S.chars[id])) S.chars[id] = firstOpen(); }
+// XP from one finished match, for every human on the keyboard (2P: both count toward the shared profile)
+function calcXp() {
+  const mult = S.cpu ? [0.75, 1, 1.25][S.level] : 1;
+  const it = { goals: 0, saves: 0, moves: 0, result: 0 };
+  (NET.role ? [NET.me] : [0, 1].filter(i => !P[i].cpu)).forEach(i => {
+    const st = stats[i];
+    it.goals += st.goals * 15;
+    it.saves += st.saves * 8;
+    it.moves += Math.min(st.skills, 12) * 4;
+    it.result += 20 + (S.winner < 0 ? 20 : (S.winner === i ? 50 + (S.score[1 - i] === 0 ? 25 : 0) : 10));   // played + win / draw / loss (+ clean sheet)
+  });
+  for (const k in it) it[k] = Math.round(it[k] * mult);
+  return it;
+}
+function awardXp() {
+  if (!NET.role && ![0, 1].some(i => !P[i].cpu)) { S.xpRes = null; return; }
+  const items = calcXp(), gain = items.goals + items.saves + items.moves + items.result;
+  const before = PROFILE.xp, lvBefore = PROFILE.level;
+  PROFILE.xp += gain; PROFILE.level = levelInfo(PROFILE.xp).level;
+  const newly = [];
+  CH.forEach((c, i) => { if (!PROFILE.unlocked[i] && UNLOCK_LEVEL[i] <= PROFILE.level) { PROFILE.unlocked[i] = true; newly.push(i); } });
+  saveProfile();
+  S.xpRes = { items, gain, before, after: PROFILE.xp, lvBefore, lvAfter: PROFILE.level, newly };
+  S.xpLv = lvBefore; S.lvFlash = -9;
+  if (PROFILE.level > lvBefore) ACH_Q.push({ id: 'spell', title: 'LEVEL UP!', name: 'LEVEL ' + PROFILE.level, pid: -1 });
+  newly.forEach(i => ACH_Q.push({ id: 'mind', title: 'FIGHTER UNLOCKED!', name: CH[i].name, pid: -1 }));
+}
+const ACH_SHOW = 3.6;
+let ACH_SAVED = {}, ACH_Q = [], ACH_CUR = null;
+try {
+  const d = JSON.parse(localStorage.getItem(ACH_KEY) || '{}');
+  if (d && typeof d === 'object') ACH.forEach(a => { if (typeof d[a.id] === 'number') ACH_SAVED[a.id] = d[a.id]; });
+} catch (e) {}
+function saveAch() { try { localStorage.setItem(ACH_KEY, JSON.stringify(ACH_SAVED)); } catch (e) {} }
+function achCount() { return ACH.filter(a => ACH_SAVED[a.id]).length; }
+// only human players earn badges; the CPU never does
+function unlock(id, pid) {
+  id = ACH_ID[id] || id;
+  if (ACH_SAVED[id] || !P[pid] || P[pid].cpu || !isMe(pid)) return;
+  const a = ACH.find(x => x.id === id); if (!a) return;
+  ACH_SAVED[id] = Date.now(); saveAch();
+  ACH_Q.push({ id, name: a.name, pid });
+}
+function checkAchievements() {
+  for (let id = 0; id < 2; id++) {
+    if (P[id].cpu) continue;
+    const st = stats[id];
+    if (st.goals >= 1) unlock('first', id);
+    if (st.goals >= 3) unlock('hat', id);
+    if (st.spells >= 5) unlock('spell', id);
+    if (st.skills >= 3) unlock('ankle', id);
+    if (st.saves >= 5 || st.blocks >= 3) unlock('brick', id);
+    if (st.hits >= 5) unlock('hit', id);
+    if (st.slips >= 3) unlock('slip', id);
+    if (st.steals >= 3) unlock('thief', id);
+  }
+}
+function updateToasts() {
+  if (ACH_CUR && S.t - ACH_CUR.t0 > ACH_SHOW) ACH_CUR = null;
+  if (!ACH_CUR && ACH_Q.length) { ACH_CUR = ACH_Q.shift(); ACH_CUR.t0 = S.t; sfx('ach'); }
+}
+function drawIcon(id, x, y, sc, locked) {
+  const ic = ACH_ICONS[id]; if (!ic) return;
+  for (let r = 0; r < 12; r++) for (let c = 0; c < 12; c++) {
+    const ch = ic.rows[r][c]; if (ch === '.') continue;
+    ctx.fillStyle = locked ? '#343b6b' : ic.pal[ch];
+    ctx.fillRect(x + c * sc, y + r * sc, sc, sc);
+  }
+  if (locked) {                                           // padlock
+    ctx.fillStyle = '#8b93b8';
+    ctx.fillRect(x + 16, y + 14, 8, 7); ctx.fillRect(x + 17, y + 10, 2, 5); ctx.fillRect(x + 21, y + 10, 2, 5); ctx.fillRect(x + 17, y + 10, 6, 2);
+    ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x + 19, y + 16, 2, 3);
+  }
+}
+function drawToast() {
+  if (!ACH_CUR) return;
+  const a = S.t - ACH_CUR.t0;
+  const k = a < 0.35 ? easeOut(a / 0.35) : (a > ACH_SHOW - 0.35 ? 1 - easeOut((a - (ACH_SHOW - 0.35)) / 0.35) : 1);
+  const w = 214, h = 38, x = Math.round(W - (w + 4) * k), y = H - h - 4;
+  ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x + 3, y + 4, w, h);
+  ctx.fillStyle = '#ffd23f'; ctx.fillRect(x, y, w, h);
+  ctx.fillStyle = '#14182b'; ctx.fillRect(x + 2, y + 2, w - 4, h - 4);
+  ctx.fillStyle = 'rgba(255,210,63,.18)'; ctx.fillRect(x + 2, y + 2, w - 4, 3);
+  ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x + 5, y + 5, 28, 28);
+  ctx.fillStyle = '#2b3158'; ctx.fillRect(x + 6, y + 6, 26, 26);
+  ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x + 7, y + 7, 24, 24);
+  drawIcon(ACH_CUR.id, x + 7, y + 7, 2, false);
+  txt(ACH_CUR.title || 'ACHIEVEMENT UNLOCKED!', x + 38, y + 9, 8, '#ffd23f');
+  txt((S.cpu || ACH_CUR.pid < 0 ? '' : 'P' + (ACH_CUR.pid + 1) + ' ') + ACH_CUR.name, x + 38, y + 22, 8, '#ffffff');
+  // twinkling pixel sparkles
+  ctx.fillStyle = '#ffffff';
+  for (let i = 0; i < 4; i++) {
+    const ph = (S.t * 3 + i * 0.7) % 1;
+    if (ph < 0.5) { const sx = x + 8 + ((i * 53) % 190), sy = y - 3 + ((i * 17) % 8); ctx.fillRect(sx, sy, 1, 3); ctx.fillRect(sx - 1, sy + 1, 3, 1); }
+  }
+}
+
+/* ---------- particles ---------- */
+const FIRE_COLS = ['#fff3a0', '#ffd23f', '#ff8a1f', '#e63c1f', '#7a1a1a'];
+const ICE_COLS = ['#ffffff', '#e6fbff', '#8fd3ff', '#3d8fe0'];
+function spawn(x, y, vx, vy, life, size, cols, grav = 0, drag = 0, shrink = true) {
+  if (particles.length > 700) particles.shift();
+  particles.push({ x, y, vx, vy, life, max: life, size, cols, grav, drag, shrink });
+}
+function burst(x, y, n, cols, speed, life, size, grav = 0) {
+  if (NET.role === 'host' && NET.inMatch) NET.ev.push(['b', Math.round(x * 10) / 10, Math.round(y * 10) / 10, n, cols, speed, life, size, grav]);
+  for (let i = 0; i < n; i++) {
+    const a = rnd(0, Math.PI * 2), s = rnd(speed * 0.3, speed);
+    spawn(x, y, Math.cos(a) * s, Math.sin(a) * s, rnd(life * 0.6, life), rnd(size * 0.6, size), cols, grav, 1.5);
+  }
+}
+function addText(s, x, y, col) {
+  if (NET.role === 'host' && NET.inMatch) NET.ev.push(['t', s, Math.round(x), Math.round(y), col]);
+  texts.push({ s, x, y, col, life: 0.9 }); }
+function updateParticles(dt) {
+  for (let i = particles.length - 1; i >= 0; i--) {
+    const p = particles[i];
+    p.life -= dt;
+    if (p.life <= 0) { particles.splice(i, 1); continue; }
+    p.vy += p.grav * dt;
+    if (p.drag) { const f = Math.max(0, 1 - p.drag * dt); p.vx *= f; p.vy *= f; }
+    p.x += p.vx * dt; p.y += p.vy * dt;
+  }
+  for (let i = texts.length - 1; i >= 0; i--) {
+    const t = texts[i]; t.life -= dt; t.y -= 16 * dt;
+    if (t.life <= 0) texts.splice(i, 1);
+  }
+}
+function confetti(team) {
+  if (NET.role === 'host' && NET.inMatch) NET.ev.push(['c', team]);
+  const x = team ? R : L, cols = team ? ['#2a6fdb', '#8fd3ff', '#ffffff', '#ffd23f'] : ['#d62839', '#ff7a59', '#ffffff', '#ffd23f'];
+  for (let i = 0; i < 110; i++) {
+    const a = rnd(-Math.PI * 0.95, -Math.PI * 0.05) + (team ? -0.25 : 0.25);
+    const s = rnd(60, 230);
+    spawn(x + (team ? -6 : 6), CY, Math.cos(a) * s * (team ? -1 : 1) * 0.9, Math.sin(a) * s, rnd(1.2, 2.4), rnd(2, 4), [pick(cols)], 260, 0.4, false);
+  }
+}
+
+/* ---------- collisions ---------- */
+function bounceCircle(p, cx, cy, cr, cvx, cvy, e) {
+  let dx = p.x - cx, dy = p.y - cy;
+  const rr = p.r + cr, d2 = dx * dx + dy * dy;
+  if (d2 >= rr * rr) return 0;
+  const d = Math.sqrt(d2);
+  let nx = 1, ny = 0;
+  if (d > 1e-4) { nx = dx / d; ny = dy / d; }
+  p.x = cx + nx * rr; p.y = cy + ny * rr;
+  const rel = (p.vx - cvx) * nx + (p.vy - cvy) * ny;
+  if (rel < 0) { p.vx -= (1 + e) * rel * nx; p.vy -= (1 + e) * rel * ny; return -rel; }
+  return 0.001;
+}
+function rectHit(x, y, r, w) {
+  const cx = clamp(x, w.x, w.x + w.w), cy = clamp(y, w.y, w.y + w.h);
+  const dx = x - cx, dy = y - cy, d2 = dx * dx + dy * dy;
+  if (d2 >= r * r) return null;
+  if (d2 > 1e-6) { const d = Math.sqrt(d2); return { nx: dx / d, ny: dy / d, pen: r - d }; }
+  const l = x - w.x, rr = w.x + w.w - x, t = y - w.y, b = w.y + w.h - y, m = Math.min(l, rr, t, b);
+  if (m === l) return { nx: -1, ny: 0, pen: l + r };
+  if (m === rr) return { nx: 1, ny: 0, pen: rr + r };
+  if (m === t) return { nx: 0, ny: -1, pen: t + r };
+  return { nx: 0, ny: 1, pen: b + r };
+}
+const CORNERS = [[L + CORNER, T + CORNER, -1, -1], [R - CORNER, T + CORNER, 1, -1], [L + CORNER, B - CORNER, -1, 1], [R - CORNER, B - CORNER, 1, 1]];
+
+function keepInRink(o, r, e) {
+  let hit = 0;
+  const push = (nx, ny) => { const vn = o.vx * nx + o.vy * ny; if (vn < 0) { o.vx -= (1 + e) * vn * nx; o.vy -= (1 + e) * vn * ny; if (-vn > hit) hit = -vn; } };
+  if (o.x < L + r) { o.x = L + r; push(1, 0); }
+  if (o.x > R - r) { o.x = R - r; push(-1, 0); }
+  if (o.y < T + r) { o.y = T + r; push(0, 1); }
+  if (o.y > B - r) { o.y = B - r; push(0, -1); }
+  for (const [cx, cy, sx, sy] of CORNERS) {
+    if ((o.x - cx) * sx > 0 && (o.y - cy) * sy > 0) {
+      const dx = o.x - cx, dy = o.y - cy, d = Math.hypot(dx, dy), m = CORNER - r;
+      if (d > m) { o.x = cx + dx / d * m; o.y = cy + dy / d * m; push(-dx / d, -dy / d); }
+    }
+  }
+  return hit;
+}
+function puckBoards() {
+  const p = puck, r = p.r, e = p.fire ? 0.93 : 0.82;
+  let hit = 0;
+  const push = (nx, ny) => { const vn = p.vx * nx + p.vy * ny; if (vn < 0) { p.vx -= (1 + e) * vn * nx; p.vy -= (1 + e) * vn * ny; if (-vn > hit) hit = -vn; } };
+  const inMouth = Math.abs(p.y - CY) < MOUTH;
+  if (p.x < L || p.x > R) {
+    const bl = L - NET_D + 2 + r, br = R + NET_D - 2 - r;
+    if (p.x < bl) { p.x = bl; push(1, 0); }
+    if (p.x > br) { p.x = br; push(-1, 0); }
+    const yt = CY - MOUMTH_FIX() + r, yb = CY + MOUMTH_FIX() - r;
+    if (p.y < yt) { p.y = yt; push(0, 1); }
+    if (p.y > yb) { p.y = yb; push(0, -1); }
+  } else if (!inMouth) {
+    if (p.x < L + r) { p.x = L + r; push(1, 0); }
+    if (p.x > R - r) { p.x = R - r; push(-1, 0); }
+  }
+  if (p.y < T + r) { p.y = T + r; push(0, 1); }
+  if (p.y > B - r) { p.y = B - r; push(0, -1); }
+  for (const [cx, cy, sx, sy] of CORNERS) {
+    if ((p.x - cx) * sx > 0 && (p.y - cy) * sy > 0) {
+      const dx = p.x - cx, dy = p.y - cy, d = Math.hypot(dx, dy), m = CORNER - r;
+      if (d > m) { p.x = cx + dx / d * m; p.y = cy + dy / d * m; push(-dx / d, -dy / d); }
+    }
+  }
+  if (hit > 70) {
+    sfx('board');
+    if (hit > 120) burst(p.x, p.y, p.fire ? 6 : 3, p.fire ? FIRE_COLS : ['#ffffff', '#c9e8f3'], 50, 0.3, 2);
+  }
+}
+function MOUMTH_FIX() { return MOUTH; }
+const POSTS = [[L, CY - MOUTH], [L, CY + MOUTH], [R, CY - MOUTH], [R, CY + MOUTH]];
+
+/* ---------- entities ---------- */
+function stepPlayer(p, h, allowInput) {
+  p.stun = Math.max(0, p.stun - h);
+  p.shield = Math.max(0, p.shield - h); p.oil = Math.max(0, p.oil - h); p.chkCd = Math.max(0, p.chkCd - h);
+  p.snapCd = Math.max(0, p.snapCd - h); p.holdT = Math.max(0, p.holdT - h);
+  p.dekeT = Math.max(0, p.dekeT - h); p.dodge = Math.max(0, p.dodge - h); p.dodgeTxt = Math.max(0, p.dodgeTxt - h);
+  p.dekeCd = Math.max(0, p.dekeCd - h); p.spinCd = Math.max(0, p.spinCd - h);
+  if (p.shield > 0) p.stun = 0;
+  if (p.stun > 0) {                              // a stun breaks every skill move
+    p.dekeT = 0; p.dodge = 0;
+    if (p.spinT > 0) { p.spinT = 0; p.ang = p.spin0; }
+  }
+  let ix = 0, iy = 0, sh = false;
+  if (allowInput && p.stun <= 0) {
+    if (p.cpu) { ix = p.aiIx; iy = p.aiIy; sh = p.aiShoot; }
+    else if (p.net) { ix = p.net.ix; iy = p.net.iy; sh = p.net.sh; }
+    else {
+      const sets = (S.cpu || NET.role) ? [P[0].k, P[1].k] : [p.k];
+      for (const k of sets) {
+        ix += (K[k.r] ? 1 : 0) - (K[k.l] ? 1 : 0);
+        iy += (K[k.d] ? 1 : 0) - (K[k.u] ? 1 : 0);
+        if (K[k.s]) sh = true;
+      }
+      ix = clamp(ix, -1, 1); iy = clamp(iy, -1, 1);
+    }
+  }
+  p.inx = ix; p.iny = iy;
+  // shot charging: hold to power up, let go to fire
+  if (sh) { p.charge = Math.min(1, p.charge + h / CHARGE_T); p.wasHeld = true; }
+  else {
+    if (p.wasHeld && allowInput && p.stun <= 0) releaseShot(p);
+    p.charge = 0; p.wasHeld = false;
+  }
+  const len = Math.hypot(ix, iy);
+  const spd = (p.spd || 1) * (1 - 0.22 * p.charge) * (p.spinT > 0 ? 1.05 : 1);
+  const oily = p.oil > 0;
+  let tx = 0, ty = 0, rate = oily ? 0.25 : 1.5;
+  if (len > 0) { ix /= len; iy /= len; tx = ix * MAXV * spd; ty = iy * MAXV * spd; rate = oily ? 1.0 : 7; }
+  if (p.dekeT > 0) {                             // side-step: a quick lateral burst that fades out
+    const f = p.dekeT / DEKE_T;
+    tx = tx * 0.4 + p.dkx * DEKE_V * f; ty = ty * 0.4 + p.dky * DEKE_V * f; rate = 14;
+  }
+  const k = Math.min(1, rate * h);
+  p.vx += (tx - p.vx) * k; p.vy += (ty - p.vy) * k;
+  if (oily) {                                    // slick oil: keep sliding and veer off course
+    const a = p.slipDir * 2.4 * h, ca = Math.cos(a), sa = Math.sin(a);
+    const nvx = p.vx * ca - p.vy * sa, nvy = p.vx * sa + p.vy * ca;
+    p.vx = nvx; p.vy = nvy;
+  }
+  if (p.spinT > 0) {                             // Spin-O-Rama: the whole skater (and stick) turns a full circle
+    p.spinT -= h;
+    if (p.spinT <= 0) { p.spinT = 0; p.ang = p.spin0; }
+    else p.ang = p.spin0 + p.spinDir * (1 - p.spinT / SPIN_T) * Math.PI * 2;
+  } else if (len > 0 && p.dekeT <= 0) {
+    let d = Math.atan2(iy, ix) - p.ang;
+    d = Math.atan2(Math.sin(d), Math.cos(d));
+    const m = TURN * h * (oily ? 0.35 : 1);
+    p.ang += clamp(d, -m, m);
+  }
+  p.x += p.vx * h; p.y += p.vy * h;
+  p.anim += Math.hypot(p.vx, p.vy) * h * 0.09;
+  const c = Math.cos(p.ang);
+  if (c > 0.25) p.face = 1; else if (c < -0.25) p.face = -1;
+  keepInRink(p, PR, 0.2);
+}
+function updateBlade(p, h) {
+  const bl = BL - 5 * p.charge;                 // the stick draws back while a shot charges
+  const nx = p.x + Math.cos(p.ang) * bl, ny = p.y + 3 + Math.sin(p.ang) * bl * 0.8;
+  let rvx = (nx - p.bx) / h, rvy = (ny - p.by) / h;
+  p.bvx += (rvx - p.bvx) * 0.5; p.bvy += (rvy - p.bvy) * 0.5;
+  const m = Math.hypot(p.bvx, p.bvy);
+  if (m > 320) { p.bvx *= 320 / m; p.bvy *= 320 / m; }
+  p.bx = nx; p.by = ny;
+}
+/* ---------- stick control: shooting and skill moves ---------- */
+function releaseShot(p) {
+  if (puck.carrier !== p.id) return;                          // nothing on the stick: the wind-up is wasted
+  const ch = p.charge, v = (SHOT_MIN + (SHOT_MAX - SHOT_MIN) * ch) * powMul(CH[p.char]);
+  const c = Math.cos(p.ang), s = Math.sin(p.ang);
+  puck.carrier = -1; puck.snapT = 0;
+  puck.vx = c * v + p.vx * 0.25; puck.vy = s * v + p.vy * 0.25;
+  puck.owner = p.id; puck.ignT = 0.12; p.snapCd = 0.3; p.holdT = 0;
+  puck.snipe = (ch >= 0.95 && (p.id === 0 ? p.x < 240 : p.x > 240)) ? p.id : -1; puck.snipeT = S.t;   // full charge from your own half
+  registerShot(p, ch > 0.3);
+  const big = ch >= 0.95;
+  burst(puck.x, puck.y, big ? 14 : 3 + Math.round(ch * 7), big ? GOLD_COLS : ['#ffffff', '#c9e8f3'], 40 + ch * 90, 0.3, big ? 3 : 2);
+  if (big) { addText('SLAPSHOT!', p.x, p.y - 18, '#ffd23f'); S.shake = Math.max(S.shake, 3); }
+  sfx(big ? 'slap' : 'shot');
+}
+function doDeke(p, side) {
+  const ca = Math.cos(p.ang), sa = Math.sin(p.ang);
+  let sg = side;
+  if (!sg) {                                                  // dodge toward the side you are steering, else alternate
+    const lat = p.inx * -sa + p.iny * ca;
+    if (Math.abs(lat) > 0.35) sg = lat > 0 ? 1 : -1; else { p.side = -p.side; sg = p.side; }
+  }
+  p.side = sg;
+  p.dkx = -sa * sg; p.dky = ca * sg;
+  p.dekeT = DEKE_T; p.dodge = DEKE_T + 0.14; p.dekeCd = 0.65; p.lastTap = S.t;
+  p.vx += p.dkx * DEKE_V * 0.4; p.vy += p.dky * DEKE_V * 0.4;
+  stat(p.id, 'skills');
+  addText('DEKE!', p.x, p.y - 18, '#ffffff');
+  burst(p.x, p.y + 3, 6, ['#ffffff', '#c9e8f3', '#8fd3ff'], 60, 0.3, 2);
+  sfx('deke');
+}
+function doSpin(p) {
+  p.dekeT = 0; p.dodge = Math.min(p.dodge, 0.12); p.lastTap = -9;
+  p.spinDir = -p.spinDir; p.spin0 = p.ang; p.spinT = SPIN_T;
+  p.spinCd = 1.1; p.dekeCd = Math.max(p.dekeCd, 0.6);
+  stat(p.id, 'skills');
+  addText('SPIN-O-RAMA!', p.x, p.y - 18, '#ffd23f');
+  burst(p.x, p.y, 12, GOLD_COLS, 80, 0.4, 2);
+  sfx('spin');
+}
+// one tap = side-step; a second tap right after = Spin-O-Rama
+function useSkill(p) {
+  if (S.mode !== 'play' || p.stun > 0) return;
+  if (S.t - p.lastTap < 0.34 && p.spinCd <= 0 && p.spinT <= 0) { doSpin(p); return; }
+  if (p.spinT > 0 || p.dekeCd > 0) return;
+  doDeke(p);
+}
+
+function stepGoalie(g, dt) {
+  g.stun = Math.max(0, g.stun - dt);
+  let fooled = null;                                   // a Shadow Clone decoy aimed at this goalie
+  for (const d of decoys) if (d.owner !== g.team) { fooled = d; break; }
+  const near = Math.abs(puck.x - g.x) < 190 && S.mode !== 'title';
+  let target = fooled ? fooled.y : (near ? puck.y : CY + Math.sin(S.t * 1.6 + g.team * 2.2) * (MOUTH - 9));
+  target = clamp(target, CY - MOUTH + GR, CY + MOUTH - GR);
+  let maxV = g.stun > 0 ? 0 : GV;
+  if (fooled) maxV *= 1.15; else if (puck.fire) maxV *= 0.35;
+  const dv = clamp((target - g.y) * 8, -maxV, maxV);
+  g.vy += (dv - g.vy) * Math.min(1, 10 * dt);
+  g.y = clamp(g.y + g.vy * dt, CY - MOUTH + GR, CY + MOUTH - GR);
+}
+function pushOutCircle(p, cx, cy, cr) {
+  let dx = p.x - cx, dy = p.y - cy, d = Math.hypot(dx, dy);
+  const m = PR + cr;
+  if (d < m) {
+    if (d < 1e-4) { dx = 1; dy = 0; d = 1; }
+    const nx = dx / d, ny = dy / d;
+    p.x = cx + nx * m; p.y = cy + ny * m;
+    const vn = p.vx * nx + p.vy * ny;
+    if (vn < 0) { p.vx -= vn * nx; p.vy -= vn * ny; }
+  }
+}
+function playerPlayer() {
+  const a = P[0], b = P[1];
+  let dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy);
+  const m = PR * 2;
+  if (d >= m) return;
+  if (a.dodge > 0 || b.dodge > 0) {                  // a side-step skater slips straight past: no bump, no stun
+    const dg = a.dodge > 0 ? a : b;
+    if (Math.hypot(a.vx - b.vx, a.vy - b.vy) > 70 && dg.dodgeTxt <= 0) {
+      dg.dodgeTxt = 0.6; addText('DODGED!', dg.x, dg.y - 16, '#ffffff'); sfx('whoosh');
+    }
+    return;
+  }
+  if (d < 1e-4) { dx = 1; dy = 0; d = 1; }
+  const nx = dx / d, ny = dy / d;
+  const ma = a.shield > 0 ? 6 : CH[a.char].mass, mb = b.shield > 0 ? 6 : CH[b.char].mass;
+  const pen = m - d;
+  a.x -= nx * pen * mb / (ma + mb); a.y -= ny * pen * mb / (ma + mb);
+  b.x += nx * pen * ma / (ma + mb); b.y += ny * pen * ma / (ma + mb);
+  const rel = (b.vx - a.vx) * nx + (b.vy - a.vy) * ny;
+  if (rel >= 0) return;
+  const closing = -rel;
+  const aAp = Math.max(0, a.vx * nx + a.vy * ny), bAp = Math.max(0, -(b.vx * nx + b.vy * ny));
+  const j = 1.45 * closing / (1 / ma + 1 / mb);
+  a.vx -= nx * j / ma; a.vy -= ny * j / ma; b.vx += nx * j / mb; b.vy += ny * j / mb;
+  if (closing < 85) return;
+  // a hard hit is a check: the harder-moving skater is the attacker
+  const atk = aAp >= bAp ? a : b, vic = atk === a ? b : a;
+  if (vic.chkCd > 0) return;
+  const power = CH[atk.char].check;
+  vic.chkCd = 0.9;
+  if (vic.shield > 0) {
+    addText('BLOCKED!', vic.x, vic.y - 16, '#ffd23f'); burst(vic.x, vic.y, 10, GOLD_COLS, 90, 0.35, 3); sfx('shield');
+    return;
+  }
+  vic.stun = Math.max(vic.stun, clamp((0.14 + (closing - 85) * 0.0028) * power, 0.12, 1.2));
+  stat(atk.id, 'hits');
+  const sgn = vic === b ? 1 : -1, extra = Math.max(0, power - 1) * closing * 0.35;
+  vic.vx += nx * sgn * extra; vic.vy += ny * sgn * extra;
+  S.shake = Math.max(S.shake, power > 1.5 ? 6 : 3);
+  addText(power > 1.5 ? 'HEAVY CHECK!' : 'CHECK!', vic.x, vic.y - 16, power > 1.5 ? '#ffd23f' : '#ffffff');
+  burst(vic.x, vic.y, power > 1.5 ? 16 : 8, ['#ffffff', '#ffd23f', '#ff8a1f'], 110, 0.35, 3);
+  sfx('hit');
+}
+
+/* ---------- spells ---------- */
+function castFire(p) {
+  if (S.mode !== 'play' || p.mana < 0.999 || p.stun > 0) return;
+  const d = Math.hypot(puck.x - p.x, puck.y - p.y);
+  if (d > FIRE_RANGE) { p.noPuck = 0.9; sfx('deny'); return; }
+  puck.carrier = -1; puck.snapT = 0; p.snapCd = 0.3; puck.snipe = -1;
+  const dx = Math.cos(p.ang), dy = Math.sin(p.ang);
+  puck.x = p.x + dx * (PR + puck.r + 2);
+  puck.y = p.y + 3 + dy * (PR + puck.r + 2) * 0.8;
+  puck.vx = dx * FIRE_V; puck.vy = dy * FIRE_V;
+  puck.fire = true; puck.owner = p.id; puck.ignT = 0.18;
+  registerShot(p, true);
+  p.mana = 0; p.wasFull = false; stats[p.id].spells++;
+  S.shake = 4;
+  burst(puck.x, puck.y, 22, FIRE_COLS, 130, 0.5, 5);
+  addText('FIREBALL!', p.x, p.y - 18, '#ffb100');
+  sfx('fire');
+}
+function castIce(p) {
+  if (S.mode !== 'play' || p.mana < 0.999 || p.stun > 0) return;
+  const c = Math.cos(p.ang), s = Math.sin(p.ang);
+  let w;
+  if (Math.abs(c) >= Math.abs(s)) {
+    w = { w: 7, h: 44, x: p.x + Math.sign(c || 1) * 24 - 3.5, y: p.y - 22 };
+  } else {
+    w = { w: 44, h: 7, x: p.x - 22, y: p.y + Math.sign(s) * 24 - 3.5 };
+  }
+  w.x = clamp(w.x, L + 3, R - 3 - w.w); w.y = clamp(w.y, T + 3, B - 3 - w.h);
+  w.t = 3; w.age = 0; w.dead = false; w.owner = p.id;
+  walls.push(w);
+  p.mana = 0; p.wasFull = false; stats[p.id].spells++;
+  S.shake = 2;
+  burst(w.x + w.w / 2, w.y + w.h / 2, 18, ICE_COLS, 90, 0.6, 4);
+  addText('ICE WALL!', p.x, p.y - 18, '#8fd3ff');
+  sfx('ice');
+}
+const SMOKE_COLS = ['#e2d1ff', '#a67cff', '#6a3fb5', '#2a1650'];
+const GOLD_COLS = ['#ffffff', '#fff3a0', '#ffd23f', '#c9a227'];
+const OIL_COLS = ['#d2ffd8', '#7be08a', '#6a3fb5', '#241a44'];
+function castSpell(p) {
+  switch (CH[p.char].spell) {
+    case 'fire': castFire(p); break;
+    case 'ice': castIce(p); break;
+    case 'clone': castClone(p); break;
+    case 'shield': castShield(p); break;
+    case 'potion': castPotion(p); break;
+  }
+}
+// Shadow Ninja: a fake puck streaks at the other goal and the goalie chases it
+function castClone(p) {
+  if (S.mode !== 'play' || p.mana < 0.999 || p.stun > 0) return;
+  const tgt = p.id === 0 ? R : L;
+  const ty = CY + rnd(-MOUTH * 0.6, MOUTH * 0.6);
+  const a = Math.atan2(ty - p.by, tgt - p.bx), sp = 150;
+  decoys.push({ x: p.bx, y: p.by, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 3, age: 0, owner: p.id });
+  p.mana = 0; p.wasFull = false; stats[p.id].spells++;
+  S.shake = Math.max(S.shake, 2);
+  burst(p.x, p.y, 20, SMOKE_COLS, 90, 0.5, 4);
+  burst(p.bx, p.by, 10, SMOKE_COLS, 60, 0.4, 3);
+  addText('SHADOW CLONE!', p.x, p.y - 18, '#c9a6ff');
+  sfx('clone');
+}
+// Paladin Guard: total immunity to checks and stuns
+function castShield(p) {
+  if (S.mode !== 'play' || p.mana < 0.999) return;
+  p.shield = 4; p.stun = 0;
+  p.mana = 0; p.wasFull = false; stats[p.id].spells++;
+  S.shake = Math.max(S.shake, 2);
+  burst(p.x, p.y - 2, 24, GOLD_COLS, 110, 0.6, 4);
+  addText('HOLY SHIELD!', p.x, p.y - 18, '#ffd23f');
+  sfx('shield');
+}
+// Alchemist: lob a flask that leaves a slick oil puddle where opponents lose control
+function castPotion(p) {
+  if (S.mode !== 'play' || p.mana < 0.999 || p.stun > 0) return;
+  let tx = p.x + Math.cos(p.ang) * 48, ty = p.y + Math.sin(p.ang) * 48;
+  for (let i = 0; i < 24 && !insideRink(tx, ty, 14); i++) { tx += (240 - tx) * 0.12; ty += (CY - ty) * 0.12; }
+  puddles.push({ x: tx, y: ty, sx: p.x, sy: p.y - 6, r: 18, t: 7, age: 0, landed: false, owner: p.id });
+  p.mana = 0; p.wasFull = false; stats[p.id].spells++;
+  addText('POTION TOSS!', p.x, p.y - 18, '#7be08a');
+  sfx('potion');
+}
+function shatterWall(w, melt) {
+  const cols = melt ? ['#ffffff', '#bfe9ff', '#8fd3ff'] : ICE_COLS;
+  for (let i = 0; i < 16; i++) {
+    spawn(w.x + rnd(0, w.w), w.y + rnd(0, w.h), rnd(-70, 70), rnd(-90, 20), rnd(0.4, 0.9), rnd(2, 4), cols, melt ? -40 : 220, 1);
+  }
+  sfx(melt ? 'melt' : 'shatter');
+}
+
+/* ---------- CPU opponent ---------- */
+const DIFF = [
+  { name: 'EASY',   spd: 0.70, react: 0.30, err: 10, lead: 0.05, tol: 0.34, wall: 0.45, fireDelay: 0.50 },
+  { name: 'NORMAL', spd: 0.86, react: 0.16, err: 5,  lead: 0.14, tol: 0.22, wall: 0.80, fireDelay: 0.25 },
+  { name: 'HARD',   spd: 1.00, react: 0.14, err: 2,  lead: 0.24, tol: 0.14, wall: 1.00, fireDelay: 0.05 }
+];
+function aiThink(p, dt) {
+  const D = DIFF[S.level];
+  const dir = p.id === 0 ? 1 : -1;               // direction this side attacks along x
+  const oppG = G[p.id === 0 ? 1 : 0];
+  const goalX = p.id === 0 ? R : L;
+  p.aiCd = Math.max(0, p.aiCd - dt);
+  p.aiT -= dt;
+
+  // pick a target every "reaction time": get behind the puck, then drive it at the far side of the goalie
+  if (p.aiT <= 0) {
+    p.aiT = D.react * rnd(0.7, 1.3);
+    let off = (CY - oppG.y) * 0.9 + rnd(-1, 1) * D.err;
+    if (Math.abs(off) < 6) off = off < 0 ? -6 : 6;
+    off = clamp(off, -(MOUTH - 9), MOUTH - 9);
+    const ay = CY + off;
+    p.aiAimY = ay;
+    const px = clamp(puck.x + puck.vx * D.lead, L + 8, R - 8);
+    const py = clamp(puck.y + puck.vy * D.lead, T + 8, B - 8);
+    let ux = px - goalX, uy = py - ay;
+    const ul = Math.hypot(ux, uy) || 1; ux /= ul; uy /= ul;
+    const rx = p.x - px, ry = p.y - py;
+    const behind = rx * ux + ry * uy;
+    const lateral = -rx * uy + ry * ux;
+    let tx, ty;
+    const mine = puck.carrier === p.id, theirs = puck.carrier === 1 - p.id;
+    if (mine) {                                          // we have it: drive at the net
+      tx = goalX - dir * 10; ty = ay;
+    } else if (theirs) {                                 // they have it: go and take it
+      tx = px; ty = py;
+    } else if (behind > 6 && Math.abs(lateral) < 10 + 0.35 * behind) {
+      tx = goalX - dir * 12; ty = ay;                    // lined up: drive through the puck at the goal
+    } else if (behind > 6) {
+      tx = px + ux * 14; ty = py + uy * 14;              // behind it but off to the side: line up
+    } else {
+      const s = lateral >= 0 ? 1 : -1;                   // in front of it: loop around
+      tx = px + ux * 30 - uy * s * 32; ty = py + uy * 30 + ux * s * 32;
+    }
+    p.aiTx = clamp(tx, L + 10, R - 10); p.aiTy = clamp(ty, T + 10, B - 10);
+  }
+
+  const dx = p.aiTx - p.x, dy = p.aiTy - p.y, d = Math.hypot(dx, dy);
+  if (d > 3) { p.aiIx = dx / d; p.aiIy = dy / d; } else { p.aiIx = 0; p.aiIy = 0; }
+
+  // unstick: wiggle somewhere else if pinned against something
+  if (d > 14 && Math.hypot(p.vx, p.vy) < 12) {
+    p.stuckT += dt;
+    if (p.stuckT > 0.7) {
+      p.stuckT = 0;
+      p.aiTx = clamp(p.x + rnd(-70, 70), L + 12, R - 12);
+      p.aiTy = clamp(p.y + rnd(-60, 60), T + 12, B - 12);
+      p.aiT = 0.45;
+    }
+  } else p.stuckT = 0;
+
+  // spells
+  if (p.mana >= 0.999 && p.aiCd <= 0 && S.mode === 'play') {
+    const opp = P[1 - p.id];
+    const dOpp = Math.hypot(opp.x - p.x, opp.y - p.y);
+    const dp = Math.hypot(puck.x - p.x, puck.y - p.y);
+    switch (CH[p.char].spell) {
+      case 'fire':                                       // fireball when the puck is close and aimed at goal
+        if (dp < FIRE_RANGE - 14) {
+          const aim = Math.atan2(p.aiAimY - p.y, goalX - p.x);
+          let da = p.ang - aim; da = Math.atan2(Math.sin(da), Math.cos(da));
+          if (Math.abs(da) < D.tol) {
+            p.aiFireT += dt;
+            if (p.aiFireT >= D.fireDelay) { castFire(p); p.aiFireT = 0; p.aiCd = 1; }
+          } else p.aiFireT = 0;
+        } else p.aiFireT = 0;
+        break;
+      case 'ice': {                                      // wall when a shot is coming at our goal
+        const dxp = (puck.x - p.x) * dir;
+        if (!puck.fire && puck.vx * dir < -70 && dxp > 8 && dxp < 110 && Math.abs(puck.y - p.y) < 45) {
+          if (Math.random() < dt * 12 * D.wall) { p.ang = dir > 0 ? 0 : Math.PI; castIce(p); p.aiCd = 1; }
+        }
+        break;
+      }
+      case 'clone':                                      // send a decoy when we're attacking with the puck close
+        if (dp < 80 && (puck.x - 240) * dir > -40 && Math.random() < dt * 6) { castClone(p); p.aiCd = 1.5; }
+        break;
+      case 'shield': {                                   // block incoming checks / fireballs, or break out of a stun
+        const incoming = puck.fire && puck.owner !== p.id && dp < 110 && (puck.vx * (p.x - puck.x) + puck.vy * (p.y - puck.y)) > 0;
+        const hit = dOpp < 42 && Math.hypot(opp.vx, opp.vy) > 55;
+        if ((incoming || hit || p.stun > 0.2) && Math.random() < dt * 10) { castShield(p); p.aiCd = 1.5; }
+        break;
+      }
+      case 'potion':                                     // toss a puddle between us and the other skater
+        if (dOpp > 30 && dOpp < 105 && Math.random() < dt * 6) {
+          p.ang = Math.atan2(opp.y - p.y, opp.x - p.x); castPotion(p); p.aiCd = 1.5;
+        }
+        break;
+    }
+  }
+
+  // with the puck on the stick: wind up and shoot when lined up, and dodge nearby defenders
+  const carrying = puck.carrier === p.id && S.mode === 'play';
+  p.carryT = carrying ? p.carryT + dt : 0;
+  if (!carrying) { p.aiShoot = false; p.aiShooting = false; }
+  else if (p.aiShooting) {
+    if (p.charge >= p.aiChgT) { p.aiShoot = false; p.aiShooting = false; } else p.aiShoot = true;
+  } else {
+    const dg = Math.abs(goalX - p.x);
+    const aim = Math.atan2(p.aiAimY - p.y, goalX - p.x);
+    let da = p.ang - aim; da = Math.atan2(Math.sin(da), Math.cos(da));
+    const range = [95, 120, 145][S.level];
+    if (p.stun <= 0 && p.spinT <= 0 && ((dg < range && Math.abs(da) < D.tol + 0.1) || (p.carryT > 3 && Math.abs(da) < 0.5))) {
+      p.aiShooting = true; p.aiShoot = true; p.aiChgT = rnd(0.45, 1) * (S.level === 0 ? 0.6 : 1);
+    }
+    const o = P[1 - p.id], od = Math.hypot(o.x - p.x, o.y - p.y);
+    if (od < 46 && p.dekeCd <= 0 && p.spinT <= 0 && p.stun <= 0 && Math.random() < dt * [0.8, 1.4, 2.0][S.level]) {
+      if (p.spinCd <= 0 && Math.random() < 0.35) doSpin(p);
+      else { doDeke(p, ((p.x - o.x) * -Math.sin(p.ang) + (p.y - o.y) * Math.cos(p.ang)) >= 0 ? 1 : -1); }
+    }
+  }
+}
+
+/* ---------- physics step ---------- */
+function dropPuck(c, vx, vy, cd) {
+  puck.carrier = -1; puck.snapT = 0; c.snapCd = Math.max(c.snapCd, cd);
+  puck.vx = vx; puck.vy = vy;
+}
+// magnet + dribble: a loose puck near a skater snaps to the stick blade and stays glued to it
+function updatePossession(h) {
+  if (puck.carrier >= 0) {
+    const c = P[puck.carrier], o = P[1 - c.id];
+    if (puck.fire) { puck.carrier = -1; }
+    else if (c.stun > 0) {                                   // knocked off their feet: the puck squirts loose
+      dropPuck(c, c.vx * 0.6 + rnd(-30, 30), c.vy * 0.6 + rnd(-30, 30), 0.6);
+      addText('DROPPED!', puck.x, puck.y - 10, '#ffffff');
+    } else {
+      // an opponent's stick or body on the puck strips it (not while dodging, spinning, shielded or just-gathered)
+      if (S.mode === 'play' && c.holdT <= 0 && c.dodge <= 0 && c.spinT <= 0 && c.shield <= 0 && o.stun <= 0 && o.snapCd <= 0) {
+        const db = Math.hypot(o.bx - puck.x, o.by - puck.y), dbody = Math.hypot(o.x - puck.x, o.y - puck.y);
+        if (db < BR + puck.r + 1 || dbody < PR + puck.r + 1) {
+          let nx = puck.x - c.x, ny = puck.y - c.y; const nl = Math.hypot(nx, ny) || 1; nx /= nl; ny /= nl;
+          dropPuck(c, nx * 110 + o.vx * 0.4, ny * 110 + o.vy * 0.4, 0.5);
+          addText('STRIPPED!', puck.x, puck.y - 10, '#ffffff'); stat(o.id, 'steals');
+          burst(puck.x, puck.y, 6, ['#ffffff', '#c9e8f3'], 60, 0.3, 2); sfx('stick');
+        }
+      }
+      if (puck.carrier >= 0) {
+        const k = Math.min(1, (puck.snapT > 0 ? 16 : 70) * h);   // a quick pull in, then tight dribble
+        puck.snapT = Math.max(0, puck.snapT - h);
+        puck.x += (c.bx - puck.x) * k; puck.y += (c.by + 1 - puck.y) * k;
+        puck.x = clamp(puck.x, L + puck.r + 1, R - puck.r - 1);   // a carried puck cannot be walked over the goal line
+        puck.vx = c.bvx; puck.vy = c.bvy;                         // it leaves the stick with the stick's momentum
+        puck.owner = c.id;
+      }
+    }
+  }
+  if (puck.carrier >= 0 || S.mode !== 'play' || puck.fire) return;
+  if (Math.hypot(puck.vx, puck.vy) > SNAP_V) return;
+  let best = null, bd = SNAP_R;
+  for (const p of P) {
+    if (p.stun > 0 || p.snapCd > 0) continue;
+    const d = Math.hypot(puck.x - p.x, puck.y - p.y);
+    if (d < bd) { bd = d; best = p; }
+  }
+  if (!best) return;
+  puck.carrier = best.id; puck.owner = best.id; puck.snapT = 0.14; puck.shotOn = false; puck.snipe = -1; best.holdT = 0.4;
+  burst(puck.x, puck.y, 4, ['#ffffff', '#fff3a0'], 40, 0.25, 2); sfx('snap');
+}
+function stepPuck(h) {
+  updatePossession(h);
+  if (puck.carrier < 0) {
+    const sp0 = Math.hypot(puck.vx, puck.vy);
+    const f = Math.exp(-(puck.fire ? 0.32 : 0.5) * h);
+    puck.vx *= f; puck.vy *= f;
+    if (sp0 < 8) { puck.vx *= 0.985; puck.vy *= 0.985; }
+    puck.x += puck.vx * h; puck.y += puck.vy * h;
+  }
+  puckBoards();
+
+  for (const [px, py] of POSTS) {
+    const imp = bounceCircle(puck, px, py, 2.5, 0, 0, 0.7);
+    if (imp > 60) sfx('stick');
+  }
+  for (const w of walls) {
+    if (w.dead) continue;
+    const hit = rectHit(puck.x, puck.y, puck.r, w);
+    if (!hit) continue;
+    if (puck.shotOn && puck.shotTeam !== w.owner) stat(w.owner, 'blocks');   // an Ice Wall block
+    puck.shotOn = false; puck.snipe = -1;       // an ice wall stops the shot
+    if (puck.fire) {
+      w.dead = true; shatterWall(w, true);
+      addText('MELT!', w.x + w.w / 2, w.y - 6, '#ffb100');
+      puck.vx *= 0.6; puck.vy *= 0.6; S.shake = Math.max(S.shake, 3);
+    } else {
+      puck.x += hit.nx * hit.pen; puck.y += hit.ny * hit.pen;
+      const vn = puck.vx * hit.nx + puck.vy * hit.ny;
+      if (vn < 0) {
+        puck.vx -= 1.9 * vn * hit.nx; puck.vy -= 1.9 * vn * hit.ny;
+        if (-vn > 50) { sfx('shatter'); burst(puck.x, puck.y, 4, ICE_COLS, 60, 0.35, 3); }
+      }
+    }
+  }
+  for (const g of G) {
+    if (puck.carrier >= 0 && Math.hypot(puck.x - g.x, puck.y - g.y) < puck.r + GR + 1) {   // the goalie pokes it off your stick
+      dropPuck(P[puck.carrier], (puck.x - g.x) * 8, (puck.y - g.y) * 8, 0.45);
+    }
+    const pvx = puck.vx, pvy = puck.vy;
+    const imp = bounceCircle(puck, g.x, g.y, GR, 0, g.vy, 0.5);
+    if (imp > 25) sfx('hit');
+    if (imp > 5) puck.snipe = -1;
+    if (imp > 5 && puck.shotOn && puck.shotTeam !== g.team && S.t - puck.shotT < 4) { stat(g.team, 'saves'); stat(puck.shotTeam, 'onGoal'); puck.shotOn = false; }
+    if (imp > 80 && puck.fire) {
+      g.stun = 1.4; puck.vx = pvx * -0.35; puck.vy = pvy * -0.35;
+      S.shake = 5; burst(g.x, g.y, 14, FIRE_COLS, 110, 0.5, 4);
+      addText('STUNNED!', g.x + (g.team ? -26 : 26), g.y - 14, '#ffd23f'); sfx('melt');
+    }
+  }
+  for (const p of P) {
+    if (puck.carrier >= 0) continue;                       // a carried puck is on a stick, not a collider
+    if (p.id === puck.owner && puck.ignT > 0) continue;
+    const pvx = puck.vx, pvy = puck.vy;
+    let imp = bounceCircle(puck, p.x, p.y, PR, p.vx, p.vy, puck.fire ? 0.5 : 0.3);
+    if (imp > 0.01) {
+      if (imp > 40) sfx('hit');
+      if (imp > 20) puck.snipe = -1;
+      if (imp > 20 && puck.shotOn && puck.shotTeam !== p.id) puck.shotOn = false;
+      if (imp > 60 && puck.fire && p.id !== puck.owner) {
+        if (p.shield > 0) {
+          S.shake = 4; burst(p.x, p.y, 14, GOLD_COLS, 120, 0.4, 3);
+          addText('BLOCKED!', p.x, p.y - 16, '#ffd23f'); sfx('shield');
+        } else {
+          if (puck.owner >= 0) stat(puck.owner, 'hits');
+          p.stun = 0.9; p.vx += pvx * 0.45; p.vy += pvy * 0.45;
+          puck.vx *= 0.6; puck.vy *= 0.6;
+          S.shake = 6; burst(p.x, p.y, 16, FIRE_COLS, 120, 0.5, 4);
+          addText('BURNED!', p.x, p.y - 16, '#ff7a59'); sfx('melt');
+        }
+      }
+    }
+    imp = p.snapCd > 0 ? 0 : bounceCircle(puck, p.bx, p.by, BR, p.bvx, p.bvy, 0.85);
+    if (imp > 20) {
+      puck.vx += Math.cos(p.ang) * 45; puck.vy += Math.sin(p.ang) * 45;
+      if (!puck.fire) puck.owner = p.id;
+      puck.snipe = -1;
+      if (puck.shotOn && puck.shotTeam !== p.id) puck.shotOn = false;
+      registerShot(p, false);
+      sfx('stick');
+    }
+  }
+  puckBoards();
+  const sp = Math.hypot(puck.vx, puck.vy);
+  const cap = puck.fire ? FIRE_V * 1.05 : 350;
+  if (sp > cap) { puck.vx *= cap / sp; puck.vy *= cap / sp; }
+  if (puck.fire && sp < 190) puck.fire = false;
+}
+function physStep(h, allowInput) {
+  P.forEach(p => stepPlayer(p, h, allowInput));
+  P.forEach(p => updateBlade(p, h));
+  G.forEach(g => stepGoalie(g, h));
+  playerPlayer();
+  for (const p of P) {
+    for (const g of G) pushOutCircle(p, g.x, g.y, GR);
+    for (const w of walls) {
+      if (w.dead) continue;
+      const hit = rectHit(p.x, p.y, PR, w);
+      if (hit) {
+        p.x += hit.nx * hit.pen; p.y += hit.ny * hit.pen;
+        const vn = p.vx * hit.nx + p.vy * hit.ny;
+        if (vn < 0) { p.vx -= vn * hit.nx; p.vy -= vn * hit.ny; }
+      }
+    }
+    keepInRink(p, PR, 0.2);
+  }
+  stepPuck(h);
+  if (S.mode === 'play') {
+    if (puck.x < L - 2 && Math.abs(puck.y - CY) < MOUTH) scoreGoal(1);
+    else if (puck.x > R + 2 && Math.abs(puck.y - CY) < MOUTH) scoreGoal(0);
+  }
+}
+function scoreGoal(team) {
+  if (puck.snipe === team && S.t - puck.snipeT < 8) unlock('sniper', team);
+  S.score[team]++;
+  S.def = S.def || [0, 0];
+  for (let t = 0; t < 2; t++) S.def[t] = Math.max(S.def[t], S.score[1 - t] - S.score[t]);   // biggest deficit each side has faced
+  if (puck.fire && puck.owner === team) unlock('fire', team);
+  if (S.ot) unlock('sudden', team);
+  else {
+    if (S.time > 0 && S.time <= 5) unlock('buzzer', team);
+    if (MATCH_TIME - S.time <= 10) unlock('quick', team);
+  }
+  if (!P[team].cpu && isMe(team)) { LIFE.goals++; saveLife(); if (LIFE.goals >= 25) unlock('machine', team); }
+  stats[team].goals++;
+  if (!(puck.shotOn && puck.shotTeam === team)) stats[team].shots++;   // a goal always counts as a shot...
+  stats[team].onGoal++;                                                // ...on goal (shots on goal = goals + saves)
+  puck.shotOn = false;
+  S.mode = 'goal'; S.goalT = 2.4; S.goalBy = team;
+  S.shake = 9; S.flash = 0.22;
+  confetti(team);
+  sfx('goal');
+}
+function endGame() {
+  S.mode = 'over'; S.overAt = S.t; S.resSel = 0;
+  S.winner = S.score[0] === S.score[1] ? -1 : (S.score[0] > S.score[1] ? 0 : 1);
+  const limit = Math.max(S.score[0], S.score[1]) >= SCORE_LIMIT;
+  S.endReason = S.winner < 0 ? 'DRAW AFTER SUDDEN DEATH'
+    : (limit ? 'SCORE LIMIT REACHED!' : (S.ot ? 'SUDDEN DEATH WINNER!' : 'TIME UP!'));
+  if (S.winner >= 0 && S.score[1 - S.winner] === 0) unlock('shutout', S.winner);
+  if (S.winner >= 0 && S.def && S.def[S.winner] >= 2) unlock('comeback', S.winner);
+  const hum = NET.role ? NET.me : (!P[0].cpu ? 0 : (!P[1].cpu ? 1 : -1));
+  if (hum >= 0) { LIFE.matches++; saveLife(); if (LIFE.matches >= 10) unlock('regular', hum); }
+  awardXp();
+  sfx('over');
+}
+
+
+/* ---------- online play: peer-to-peer over WebRTC (PeerJS) ---------- */
+// The host runs the whole match (it is the referee) and streams the game state ~30x/sec; the guest only
+// sends its controls and draws what it receives. Room codes are just PeerJS ids with a prefix.
+const NET_PREFIX = 'spellblade-hockey-', NET_ALPHA = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
+const PF = ['x', 'y', 'vx', 'vy', 'ang', 'face', 'char', 'shield', 'oil', 'stun', 'mana', 'charge', 'dekeT', 'dkx', 'dky', 'spinT', 'anim', 'noPuck', 'bx', 'by'];
+const STAT_KEYS = ['shots', 'onGoal', 'goals', 'saves', 'spells', 'hits', 'skills', 'blocks', 'slips', 'steals'];
+const rd = (v, d) => Math.round(v * d) / d;
+const num = (v, d = 0) => (typeof v === 'number' && isFinite(v)) ? v : d;
+function netSend(m) { try { if (NET.conn && NET.conn.open) NET.conn.send(m); } catch (e) {} }
+function myPick() { return S.cpu ? S.chars[humanId()] : S.chars[0]; }
+function openLobby() { sanitizeChars(); S.mode = 'lobby'; S.lob = { st: 'menu', code: '', msg: '' }; sfx('tick'); }
+function leaveLobby() { netClose(); S.lob = null; S.mode = 'title'; S.tab = 0; sfx('tick'); }
+function lobErr(msg) { netClose(); S.mode = 'lobby'; S.lob = { st: 'menu', code: '', msg }; sfx('deny'); }
+function netClose() {
+  if (NET.conn) { try { netSend({ t: 'bye' }); NET.conn.close(); } catch (e) {} }
+  if (NET.peer) { try { NET.peer.destroy(); } catch (e) {} }
+  if (NET.inMatch && NET.saved) { S.chars = NET.saved.chars; S.cpu = NET.saved.cpu; }
+  NET.saved = null; NET.role = null; NET.conn = null; NET.peer = null; NET.inMatch = false; NET.ev = []; NET.rem = false;
+  NET.inp.ix = NET.inp.iy = 0; NET.inp.sh = false; P.forEach(p => { p.net = null; });
+}
+function netLost(msg) {
+  if (!NET.role) return;
+  const was = NET.inMatch;
+  netClose(); toMenu();
+  S.mode = 'lobby'; S.lob = { st: 'menu', code: '', msg: msg || (was ? 'OPPONENT LEFT THE MATCH' : 'DISCONNECTED') }; sfx('deny');
+}
+function netAttach(c) {
+  NET.conn = c;
+  c.on('open', () => { netSend({ t: 'hello', char: myPick() }); NET.lastRx = performance.now(); });
+  c.on('data', m => { NET.lastRx = performance.now(); netData(m); });
+  c.on('close', () => { if (NET.conn === c) netLost(); });
+  c.on('error', () => { if (NET.conn === c) netLost('CONNECTION ERROR'); });
+}
+function netHost(tries = 0) {
+  if (typeof Peer === 'undefined') { lobErr('ONLINE NEEDS THE INTERNET - COULD NOT LOAD'); return; }
+  netClose();
+  const code = Array.from({ length: 5 }, () => NET_ALPHA[Math.floor(Math.random() * NET_ALPHA.length)]).join('');
+  NET.role = 'host'; NET.me = 0; S.lob = { st: 'hosting', code: '', msg: 'CREATING ROOM...' };
+  try {
+    const peer = NET.peer = new Peer(NET_PREFIX + code);
+    peer.on('open', () => { if (NET.peer === peer) { S.lob.code = code; S.lob.msg = 'WAITING FOR A PLAYER...'; } });
+    peer.on('connection', c => {
+      if (NET.conn && NET.conn.open) { c.on('open', () => { try { c.send({ t: 'bye' }); c.close(); } catch (e) {} }); return; }
+      netAttach(c);
+    });
+    peer.on('error', e => {
+      if (NET.peer !== peer) return;
+      if (e && e.type === 'unavailable-id' && tries < 3) netHost(tries + 1);
+      else lobErr('COULD NOT CREATE ROOM (' + ((e && e.type) || 'ERROR').toUpperCase().replace(/-/g, ' ') + ')');
+    });
+  } catch (e) { lobErr('COULD NOT CREATE ROOM'); }
+}
+function netJoin() {
+  const code = S.lob.code;
+  if (code.length !== 5) { S.lob.msg = 'ROOM CODES ARE 5 CHARACTERS'; sfx('deny'); return; }
+  if (typeof Peer === 'undefined') { lobErr('ONLINE NEEDS THE INTERNET - COULD NOT LOAD'); return; }
+  netClose();
+  NET.role = 'guest'; NET.me = 1; S.lob = { st: 'connecting', code, msg: 'CONNECTING...' };
+  try {
+    const peer = NET.peer = new Peer();
+    peer.on('open', () => {
+      if (NET.peer !== peer) return;
+      netAttach(peer.connect(NET_PREFIX + code, { reliable: true, serialization: 'json' }));
+    });
+    peer.on('error', e => {
+      if (NET.peer !== peer) return;
+      lobErr(e && e.type === 'peer-unavailable' ? 'ROOM NOT FOUND - CHECK THE CODE' : 'COULD NOT CONNECT (' + ((e && e.type) || 'ERROR').toUpperCase().replace(/-/g, ' ') + ')');
+    });
+    setTimeout(() => { if (NET.peer === peer && S.lob && S.lob.st === 'connecting') lobErr('CONNECTION TIMED OUT'); }, 15000);
+  } catch (e) { lobErr('COULD NOT CONNECT'); }
+}
+function netData(m) {
+  if (!m || typeof m !== 'object') return;
+  switch (m.t) {
+    case 'hello':
+      NET.peerChar = clamp(num(m.char) | 0, 0, CH.length - 1);
+      if (S.lob) { S.lob.st = 'ready'; S.lob.msg = ''; }
+      sfx('ready'); break;
+    case 'bye': netLost('OPPONENT LEFT'); break;
+    case 'in':                                                       // host: the guest's controls
+      NET.inp.ix = clamp(num(m.x), -1, 1); NET.inp.iy = clamp(num(m.y), -1, 1); NET.inp.sh = !!m.s; break;
+    case 'sp': if (NET.role === 'host' && NET.inMatch && S.mode === 'play') castSpell(P[1]); break;
+    case 'sk': if (NET.role === 'host' && NET.inMatch) useSkill(P[1]); break;
+    case 'rem': if (NET.role === 'host' && S.mode === 'over') { S.remReq = true; sfx('ready'); } break;
+    case 'start': if (NET.role === 'guest') guestStart(m); break;
+    case 's': if (NET.role === 'guest' && NET.inMatch) netApply(m); break;
+  }
+}
+function lobbyStartMatch() {                                         // host: SPACE in the lobby
+  if (NET.role !== 'host' || !S.lob || S.lob.st !== 'ready') return;
+  NET.saved = { chars: S.chars.slice(), cpu: S.cpu };
+  S.cpu = false; S.chars = [myPick(), NET.peerChar];
+  NET.inMatch = true; P[1].net = NET.inp; NET.inp.ix = NET.inp.iy = 0; NET.inp.sh = false;
+  startGame();
+}
+function rematch() {
+  if (NET.role === 'guest') { if (!NET.rem) { NET.rem = true; netSend({ t: 'rem' }); sfx('tick'); } }
+  else startGame();
+}
+function guestStart(m) {
+  if (!NET.saved) NET.saved = { chars: S.chars.slice(), cpu: S.cpu };
+  NET.inMatch = true; NET.rem = false; NET.inT = 0;
+  S.chars = [clamp(num(m.chars && m.chars[0]) | 0, 0, CH.length - 1), clamp(num(m.chars && m.chars[1]) | 0, 0, CH.length - 1)];
+  S.cpu = false; S.score = [0, 0]; S.time = MATCH_TIME; S.ot = false; S.winner = -1; S.xpRes = null; S.resSel = 0;
+  P.forEach(p => { p.cpu = false; p.net = null; p.char = S.chars[p.id]; });
+  particles.length = 0; texts.length = 0; resetPositions();
+  stats[0] = mkStats(); stats[1] = mkStats();
+  S.mode = 'intro'; S.introT = 0; S.cd = 2.4; S.lob = null;
+}
+// ---- host: build + send the state snapshot -------------------------------------------------------------
+function hostTick(dt) {
+  if (performance.now() - NET.lastRx > 7000) { netLost('CONNECTION LOST'); return; }
+  NET.sAcc += dt;
+  if (NET.sAcc < 1 / 30) return;
+  NET.sAcc = 0;
+  netSend({
+    t: 's', mo: S.mode, tm: rd(S.time, 100), ot: S.ot ? 1 : 0, cd: rd(S.cd, 100), gt: rd(S.goalT, 100), gb: S.goalBy, gbn: rd(S.goBanner, 100),
+    it: rd(S.introT, 100), sc: S.score.slice(), w: S.winner, er: S.endReason || '', sk: rd(S.shake, 10), fl: rd(S.flash, 100),
+    p: P.map(p => PF.map(k => rd(p[k], k === 'x' || k === 'y' || k === 'bx' || k === 'by' ? 10 : 100))),
+    g: G.map(g => [rd(g.y, 10), rd(g.stun, 100), rd(g.vy, 10)]),
+    pk: [rd(puck.x, 10), rd(puck.y, 10), rd(puck.vx, 10), rd(puck.vy, 10), puck.fire ? 1 : 0, puck.carrier],
+    wl: walls.map(w => [rd(w.x, 10), rd(w.y, 10), w.w, w.h, rd(w.t, 100), rd(w.age, 100)]),
+    dc: decoys.map(d => [rd(d.x, 10), rd(d.y, 10), rd(d.vx, 10), rd(d.vy, 10), rd(d.t, 100), rd(d.age, 100), d.owner]),
+    pd: puddles.map(q => [rd(q.x, 10), rd(q.y, 10), rd(q.sx, 10), rd(q.sy, 10), q.r, rd(q.t, 100), rd(q.age, 100), q.landed ? 1 : 0, q.owner]),
+    st: stats.map(o => STAT_KEYS.map(k => o[k])),
+    ev: NET.ev.splice(0)
+  });
+}
+// ---- guest: apply a snapshot, then keep things moving between snapshots ------------------------------
+function netApply(m) {
+  const prev = S.mode;
+  S.mode = m.mo; S.time = num(m.tm); S.ot = !!m.ot; S.cd = num(m.cd); S.goalT = num(m.gt); S.goalBy = m.gb ? 1 : 0; S.goBanner = num(m.gbn);
+  S.introT = num(m.it); S.score = [num(m.sc && m.sc[0]), num(m.sc && m.sc[1])]; S.winner = num(m.w, -1); S.endReason = String(m.er || '');
+  S.shake = Math.max(S.shake, num(m.sk)); S.flash = Math.max(S.flash, num(m.fl));
+  (m.p || []).forEach((a, i) => { const p = P[i]; if (p) PF.forEach((k, j) => { p[k] = num(a[j]); }); });
+  P.forEach(p => { p.char = clamp(p.char | 0, 0, CH.length - 1); });
+  (m.g || []).forEach((a, i) => { if (G[i]) { G[i].y = num(a[0], CY); G[i].stun = num(a[1]); G[i].vy = num(a[2]); } });
+  if (m.pk) { puck.x = num(m.pk[0], 240); puck.y = num(m.pk[1], CY); puck.vx = num(m.pk[2]); puck.vy = num(m.pk[3]); puck.fire = !!m.pk[4]; puck.carrier = num(m.pk[5], -1); }
+  walls = (m.wl || []).map(a => ({ x: a[0], y: a[1], w: a[2], h: a[3], t: a[4], age: a[5], dead: false }));
+  decoys = (m.dc || []).map(a => ({ x: a[0], y: a[1], vx: a[2], vy: a[3], t: a[4], age: a[5], owner: a[6] }));
+  puddles = (m.pd || []).map(a => ({ x: a[0], y: a[1], sx: a[2], sy: a[3], r: a[4], t: a[5], age: a[6], landed: !!a[7], owner: a[8] }));
+  (m.st || []).forEach((a, i) => { if (stats[i]) STAT_KEYS.forEach((k, j) => { stats[i][k] = num(a[j]); }); });
+  (m.ev || []).forEach(e => {                                         // sounds, bursts and floating text from the host
+    try {
+      if (e[0] === 's') sfx(e[1]);
+      else if (e[0] === 'b') burst(e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8]);
+      else if (e[0] === 't') addText(e[1], e[2], e[3], e[4]);
+      else if (e[0] === 'c') confetti(e[1]);
+    } catch (x) {}
+  });
+  if (m.mo === 'intro' && prev !== 'intro') { particles.length = 0; texts.length = 0; }
+  if (m.mo === 'over' && prev !== 'over') { S.overAt = S.t; S.resSel = 0; NET.rem = false; awardXp(); }
+}
+function guestTick(dt) {
+  if (performance.now() - NET.lastRx > 7000) { netLost('CONNECTION LOST'); return; }
+  const m = S.mode;
+  if (m === 'intro') S.introT += dt; else if (m === 'countdown') S.cd -= dt; else if (m === 'goal') S.goalT -= dt;
+  if (m === 'play' || m === 'goal' || m === 'countdown') {
+    for (const p of P) {                                              // dead-reckon until the next snapshot arrives
+      p.x += p.vx * dt; p.y += p.vy * dt; p.bx += p.vx * dt; p.by += p.vy * dt; p.anim += Math.hypot(p.vx, p.vy) * dt * 0.09;
+    }
+    if (m === 'play' && puck.carrier < 0) { puck.x += puck.vx * dt; puck.y += puck.vy * dt; }
+    G.forEach(g => { g.y = clamp(g.y + g.vy * dt, T + 12, B - 12); });
+  }
+  walls.forEach(w => { w.t -= dt; w.age += dt; });
+  decoys.forEach(d => { d.x += d.vx * dt; d.y += d.vy * dt; d.t -= dt; d.age += dt; });
+  puddles.forEach(q => { q.age += dt; if (q.landed) q.t -= dt; });
+  if (puck.fire && m === 'play') for (let i = 0; i < 3; i++) spawn(puck.x + rnd(-2, 2), puck.y + rnd(-2, 2), -puck.vx * 0.04 + rnd(-14, 14), rnd(-24, -4), rnd(0.25, 0.5), rnd(3, 6), FIRE_COLS);
+  ambient(dt);
+  NET.inT += dt;                                                      // my controls -> host
+  if (NET.inT >= 1 / 30) {
+    NET.inT = 0;
+    let ix = 0, iy = 0, sh = false;
+    for (const k of [BIND[0], BIND[1]]) {
+      ix += (K[k.r] ? 1 : 0) - (K[k.l] ? 1 : 0); iy += (K[k.d] ? 1 : 0) - (K[k.u] ? 1 : 0);
+      if (K[k.s]) sh = true;
+    }
+    netSend({ t: 'in', x: clamp(ix, -1, 1), y: clamp(iy, -1, 1), s: sh ? 1 : 0 });
+  }
+}
+function guestPress(c) {
+  const m = S.mode;
+  if (m === 'play' || m === 'countdown' || m === 'goal') {
+    if (m === 'play') {
+      if ([BIND[0], BIND[1]].some(k => k.sp === c)) netSend({ t: 'sp' });
+      if ([BIND[0], BIND[1]].some(k => k.sk === c)) netSend({ t: 'sk' });
+    }
+    return;
+  }
+  if (c === 'Escape' && m !== 'over') { toMenu(); return; }
+  if (m === 'over') {
+    if (c === 'Escape' || c === 'KeyC') { toMenu(); return; }
+    if (S.t - S.overAt < RES_READY) return;
+    if (c === 'KeyR') rematch();
+    else if (c === 'ArrowLeft' || c === 'ArrowRight' || c === 'KeyA' || c === 'KeyD') { S.resSel = 1 - S.resSel; sfx('tick'); }
+    else if (c === 'Space' || c === 'Enter') { if (S.resSel === 0) rematch(); else toMenu(); }
+  }
+}
+// ---- lobby screen -------------------------------------------------------------------------------------------------
+function lobbyPress(c) {
+  const L = S.lob; if (!L) return;
+  if (c === 'Escape') {
+    if (L.st === 'joining' || (L.st === 'menu')) { if (L.st === 'menu') leaveLobby(); else { L.st = 'menu'; L.msg = ''; sfx('tick'); } }
+    else leaveLobby();
+    return;
+  }
+  if (L.st === 'menu') {
+    if (c === 'KeyH') netHost();
+    else if (c === 'KeyJ') { S.lob = { st: 'joining', code: '', msg: '' }; sfx('tick'); }
+  } else if (L.st === 'joining') {
+    if (c === 'Enter') netJoin();
+    else if (c === 'Backspace') { L.code = L.code.slice(0, -1); L.msg = ''; }
+    else {
+      const ch = c.startsWith('Key') ? c.slice(3) : (c.startsWith('Digit') ? c.slice(5) : '');
+      if (ch.length === 1 && NET_ALPHA.includes(ch) && L.code.length < 5) { L.code += ch; L.msg = ''; sfx('tick'); }
+    }
+  } else if (L.st === 'ready' && NET.role === 'host' && (c === 'Space' || c === 'Enter')) lobbyStartMatch();
+}
+function lobbyClick(x, y) {
+  const L = S.lob; if (!L) return;
+  if (L.st === 'menu') {
+    if (y >= 96 && y < 116) netHost();
+    else if (y >= 124 && y < 144) { S.lob = { st: 'joining', code: '', msg: '' }; sfx('tick'); }
+    else if (y >= 250) leaveLobby();
+  } else if (L.st === 'ready' && NET.role === 'host' && y >= 215 && y < 240) lobbyStartMatch();
+  else if (y >= 262) { if (L.st === 'joining') { L.st = 'menu'; L.msg = ''; } else leaveLobby(); }
+}
+function drawLobby() {
+  const L = S.lob || { st: 'menu', code: '', msg: '' };
+  ctx.fillStyle = 'rgba(11,13,26,.97)'; ctx.fillRect(0, 0, W, H);
+  const blink = Math.floor(S.t * 3) % 2;
+  txt('ONLINE PLAY', 240, 18, 16, '#ffd23f', 'center', '#7a1a1a');
+  txt('1 VS 1 OVER THE INTERNET - NO ACCOUNT NEEDED', 240, 42, 8, '#7f8bb5', 'center');
+  const back = () => txt('ESC = BACK', 240, 266, 8, '#5b6590', 'center');
+  if (L.st === 'menu') {
+    txt('H   HOST A GAME', 240, 100, 8, '#ffd23f', 'center'); txt('GET A ROOM CODE TO SHARE', 240, 111, 8, '#7f8bb5', 'center');
+    txt('J   JOIN A GAME', 240, 128, 8, '#8fd3ff', 'center'); txt('TYPE YOUR FRIEND\'S CODE', 240, 139, 8, '#7f8bb5', 'center');
+    txt('YOUR FIGHTER: ' + CH[myPick()].name, 240, 180, 8, CH[myPick()].col, 'center');
+    txt('CHANGE IT ON THE FIGHTER TAB FIRST', 240, 192, 8, '#5b6590', 'center');
+    txt('HOST PLAYS RED - GUEST PLAYS BLUE', 240, 214, 8, '#b8c4ee', 'center');
+    if (L.msg) txt(L.msg, 240, 236, 8, '#ff5a5f', 'center');
+    back();
+  } else if (L.st === 'hosting') {
+    txt('ROOM CODE', 240, 76, 8, '#8fd3ff', 'center');
+    txt(L.code || '.....', 240, 94, 32, '#ffffff', 'center', '#1b4b8a');
+    txt(L.msg || '', 240, 140, 8, blink ? '#ffd23f' : '#ffffff', 'center');
+    txt('SEND THIS CODE TO YOUR FRIEND - THEY PRESS', 240, 176, 8, '#b8c4ee', 'center');
+    txt('O ON THE TITLE SCREEN, THEN J TO JOIN', 240, 188, 8, '#b8c4ee', 'center');
+    back();
+  } else if (L.st === 'joining' || L.st === 'connecting') {
+    txt('ENTER ROOM CODE', 240, 70, 8, '#8fd3ff', 'center');
+    for (let i = 0; i < 5; i++) {
+      const x = 240 - 110 + i * 44;
+      ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x, 92, 40, 46);
+      ctx.fillStyle = i === L.code.length && L.st === 'joining' ? '#ffd23f' : '#3a4175'; ctx.fillRect(x + 2, 94, 36, 42);
+      ctx.fillStyle = '#14182b'; ctx.fillRect(x + 4, 96, 32, 38);
+      if (L.code[i]) txt(L.code[i], x + 20, 104, 24, '#ffffff', 'center');
+    }
+    if (L.st === 'joining') {
+      txt('ENTER = JOIN    CTRL+V = PASTE', 240, 156, 8, blink ? '#ffd23f' : '#ffffff', 'center');
+      txt(L.msg || '', 240, 184, 8, '#ff5a5f', 'center');
+    } else txt(L.msg, 240, 160, 8, blink ? '#ffd23f' : '#ffffff', 'center');
+    back();
+  } else if (L.st === 'ready') {
+    const card = (id, x) => {
+      const mine = id === NET.me, ch = CH[mine ? myPick() : NET.peerChar], team = id ? '#2a6fdb' : '#d62839', light = id ? '#8fd3ff' : '#ff7a59';
+      ctx.fillStyle = team; ctx.fillRect(x, 64, 200, 100); ctx.fillStyle = '#14182b'; ctx.fillRect(x + 2, 66, 196, 96);
+      txt((id ? 'GUEST - BLUE' : 'HOST - RED') + (mine ? ' (YOU)' : ''), x + 100, 72, 8, light, 'center');
+      blit(SPR[CH.indexOf(ch)][id][Math.abs(Math.floor(S.t * 3)) % 2], x + 76, 90, id === 1, 3);
+      txt(ch.name, x + 100, 138, 8, ch.col, 'center');
+      txt(ch.spellName, x + 100, 150, 8, '#e4f7ff', 'center');
+    };
+    card(0, 30); card(1, 250);
+    txt('VS', 240, 100, 16, '#ffd23f', 'center');
+    txt('CONNECTED!', 240, 184, 8, '#7be08a', 'center');
+    if (NET.role === 'host') {
+      ctx.fillStyle = blink ? '#ffd23f' : '#c9a227'; ctx.fillRect(130, 212, 220, 24);
+      txt('SPACE = START MATCH', 240, 220, 8, '#14182b', 'center', null);
+    } else txt('WAITING FOR THE HOST TO START...', 240, 220, 8, blink ? '#ffd23f' : '#ffffff', 'center');
+    txt('ESC = LEAVE', 240, 266, 8, '#5b6590', 'center');
+  }
+}
+
+/* ---------- per-frame update ---------- */
+function auraParticle(p) {
+  const hx = p.x + p.face * 0.5, hy = p.y - 9;
+  switch (p.char) {
+    case 0: spawn(hx + rnd(-1, 1), hy, rnd(-6, 6), rnd(-26, -12), rnd(0.25, 0.45), rnd(2, 3), FIRE_COLS); break;
+    case 1: spawn(hx + rnd(-3, 3), hy + rnd(-2, 3), rnd(-8, 8), rnd(2, 12), rnd(0.4, 0.7), 2, ICE_COLS); break;
+    case 2: spawn(p.x + rnd(-5, 5), p.y + rnd(-6, 6), rnd(-6, 6), rnd(-10, 0), rnd(0.3, 0.55), 2, ['#a67cff', '#6a3fb5', '#2a1650']); break;
+    case 3: spawn(hx + rnd(-4, 4), hy + rnd(-2, 4), rnd(-4, 4), rnd(-16, -6), rnd(0.35, 0.6), 2, GOLD_COLS); break;
+    default: spawn(hx + rnd(-4, 4), hy + rnd(-1, 3), rnd(-5, 5), rnd(-20, -8), rnd(0.4, 0.7), 2, ['#d2ffd8', '#7be08a', '#2f9e55']);
+  }
+}
+function ambient(dt) {
+  P.forEach(p => {
+    if (S.mode === 'paused') return;
+    if (Math.random() < dt * 14) auraParticle(p);
+    if (p.shield > 0 && Math.random() < dt * 20) spawn(p.x + rnd(-9, 9), p.y + rnd(-11, 7), 0, rnd(-14, -4), 0.4, 2, GOLD_COLS);
+    if (p.oil > 0 && Math.random() < dt * 24) spawn(p.x + rnd(-6, 6), p.y + rnd(0, 7), rnd(-10, 10), rnd(-6, 6), 0.35, 2, OIL_COLS);
+    if (p.dekeT > 0 && Math.random() < dt * 60) spawn(p.x + rnd(-4, 4), p.y + rnd(-6, 6), -p.dkx * 20, -p.dky * 20, 0.25, 2, ['#ffffff', '#c9e8f3', '#8fd3ff']);
+    if (p.spinT > 0) spawn(p.bx + rnd(-1, 1), p.by + rnd(-1, 1), rnd(-8, 8), rnd(-8, 8), 0.3, 2, GOLD_COLS);
+    if (p.charge >= 0.999 && Math.random() < dt * 20) spawn(p.bx + rnd(-3, 3), p.by + rnd(-3, 3), rnd(-12, 12), rnd(-18, -4), 0.3, 2, GOLD_COLS);
+    if (p.stun > 0 && Math.random() < dt * 25) spawn(p.x + rnd(-6, 6), p.y - 10, rnd(-10, 10), rnd(-30, -10), 0.4, 2, ['#ffd23f', '#ffffff']);
+  });
+  G.forEach(g => {
+    if (g.stun > 0 && Math.random() < dt * 25) spawn(g.x + rnd(-6, 6), g.y - 10, rnd(-10, 10), rnd(-30, -10), 0.4, 2, ['#ffd23f', '#ffffff']);
+  });
+}
+function liveUpdate(dt) {
+  for (const w of walls) {
+    w.t -= dt; w.age += dt;
+    if (!w.dead && Math.random() < dt * 8) spawn(w.x + rnd(0, w.w), w.y + rnd(0, w.h), rnd(-8, 8), rnd(-14, -4), 0.5, 2, ICE_COLS);
+    if (!w.dead && w.t <= 0) { w.dead = true; shatterWall(w, false); }
+  }
+  walls = walls.filter(w => !w.dead);
+  if (puck.fire) {
+    for (let i = 0; i < 3; i++) {
+      spawn(puck.x + rnd(-2, 2), puck.y + rnd(-2, 2), -puck.vx * 0.04 + rnd(-14, 14), rnd(-24, -4), rnd(0.25, 0.5), rnd(3, 6), FIRE_COLS);
+    }
+  }
+  // Shadow Clone decoys: slide around, fool the goalie, then vanish in smoke
+  for (let i = decoys.length - 1; i >= 0; i--) {
+    const d = decoys[i];
+    d.age += dt; d.t -= dt;
+    const f = Math.exp(-0.12 * dt); d.vx *= f; d.vy *= f;
+    d.x += d.vx * dt; d.y += d.vy * dt;
+    keepInRink(d, 3, 1);
+    if (Math.random() < dt * 30) spawn(d.x + rnd(-2, 2), d.y + rnd(-2, 2), rnd(-10, 10), rnd(-14, 0), 0.5, rnd(2, 4), SMOKE_COLS);
+    const g = G.find(gg => gg.team !== d.owner);
+    let gone = d.t <= 0;
+    if (g && Math.hypot(d.x - g.x, d.y - g.y) < GR + 5) {
+      gone = true; g.stun = Math.max(g.stun, 0.7); S.shake = Math.max(S.shake, 3);
+      addText('FOOLED!', g.x + (g.team ? -26 : 26), g.y - 14, '#c9a6ff'); unlock('mind', d.owner);
+    }
+    if (gone) { burst(d.x, d.y, 16, SMOKE_COLS, 80, 0.5, 4); sfx('poof'); decoys.splice(i, 1); }
+  }
+  // Potion Toss puddles: flask in flight, then a slippery patch for opponents
+  for (let i = puddles.length - 1; i >= 0; i--) {
+    const q = puddles[i];
+    q.age += dt;
+    if (!q.landed) {
+      if (q.age >= 0.3) { q.landed = true; burst(q.x, q.y, 22, OIL_COLS, 80, 0.5, 3, 80); sfx('potion'); S.shake = Math.max(S.shake, 2); }
+      continue;
+    }
+    q.t -= dt;
+    if (q.t <= 0) { puddles.splice(i, 1); continue; }
+    if (Math.random() < dt * 5) spawn(q.x + rnd(-q.r, q.r) * 0.7, q.y + rnd(-q.r, q.r) * 0.5, 0, rnd(-14, -6), 0.7, 2, ['#d2ffd8', '#7be08a']);
+    for (const p of P) {
+      if (p.id === q.owner) continue;
+      const ex = (p.x - q.x) / q.r, ey = (p.y - q.y) / (q.r * 0.75);
+      if (ex * ex + ey * ey < 1.15) {
+        if (p.oil <= 0) { p.slipDir = Math.random() < 0.5 ? -1 : 1; addText('SLIP!', p.x, p.y - 16, '#7be08a'); sfx('slip'); stat(q.owner, 'slips'); }
+        p.oil = 0.6;
+      }
+    }
+  }
+}
+function update(dt) {
+  updateCore(dt);
+  if (NET.role === 'host' && NET.inMatch) hostTick(dt);
+}
+function updateCore(dt) {
+  S.t += dt;
+  updateToasts();
+  S.shake = Math.max(0, S.shake - 28 * dt);
+  S.flash = Math.max(0, S.flash - dt);
+  if (S.mode === 'paused') return;
+  P.forEach(p => { p.noPuck = Math.max(0, p.noPuck - dt); });
+  puck.ignT = Math.max(0, puck.ignT - dt);
+  S.goBanner = Math.max(0, S.goBanner - dt);
+  const m = S.mode;
+  if (NET.role === 'guest' && NET.inMatch) { guestTick(dt); updateParticles(dt); return; }
+
+  if (m === 'title' || m === 'over' || m === 'lobby') {
+    G.forEach(g => stepGoalie(g, dt));
+    ambient(dt);
+  } else if (m === 'intro') {
+    S.introT += dt;
+    if (S.introT >= 3.6) skipIntro();
+  } else if (m === 'countdown') {
+    const prev = Math.ceil(S.cd / 0.8);
+    S.cd -= dt;
+    G.forEach(g => stepGoalie(g, dt));
+    const cur = Math.ceil(S.cd / 0.8);
+    if (cur !== prev && cur > 0) sfx('tick');
+    ambient(dt);
+    if (S.cd <= 0) { S.mode = 'play'; S.goBanner = 0.8; sfx('whistle'); }
+  } else if (m === 'play' || m === 'goal') {
+    if (S.mode === 'play') P.forEach(p => { if (p.cpu) aiThink(p, dt); });
+    acc += dt;
+    while (acc >= STEP) { physStep(STEP, S.mode === 'play'); acc -= STEP; }
+    liveUpdate(dt);
+    checkAchievements();
+    ambient(dt);
+    if (S.mode === 'play') {
+      if (!S.ot) S.time -= dt; else S.otT += dt;
+      P.forEach(p => {
+        p.mana = Math.min(1, p.mana + dt / MANA_TIME * regenMul(CH[p.char]));
+        if (p.mana >= 0.999 && !p.wasFull) { p.wasFull = true; if (isMe(p.id)) sfx('ready'); else if (NET.role === 'host') NET.ev.push(['s', 'ready']); }
+      });
+      if (!S.ot && S.time <= 0) {
+        S.time = 0; sfx('whistle');
+        if (S.score[0] === S.score[1]) {
+          S.ot = true; S.otT = 0; resetPositions(); S.mode = 'countdown'; S.cd = 2.4;
+        } else endGame();
+      } else if (S.ot && S.otT >= 30) { sfx('whistle'); endGame(); }   // sudden death times out as a draw
+    } else if (S.mode === 'goal') {
+      S.goalT -= dt;
+      if (S.goalT <= 0) {
+        if (S.ot || S.time <= 0 || Math.max(S.score[0], S.score[1]) >= SCORE_LIMIT) endGame();
+        else { resetPositions(); S.mode = 'countdown'; S.cd = 2.4; }
+      }
+    }
+  }
+  updateParticles(dt);
+}
+
+/* ---------- rendering ---------- */
+function drawStick(p) {
+  // Side-view hockey stick: long wooden shaft down to the ice, then a flat blade
+  // kicked out in the direction the skater faces, with white tape and a team-coloured knob.
+  const d = p.face < 0 ? -1 : 1;
+  const hx = Math.round(p.x + d * 3), hy = Math.round(p.y + 1);          // top hand
+  const bx = Math.round(p.bx), by = Math.round(p.by);                    // blade contact point
+  const heelX = bx - d * 2, toeX = bx + d * 3;
+  const OUT = '#14182b';
+
+  // shaft outline, then wood
+  [[-1, 0], [1, 0], [0, -1], [0, 1]].forEach(o => pxLine(hx + o[0], hy + o[1], heelX + o[0], by + o[1], OUT));
+  pxLine(hx, hy, heelX, by, '#d9a05b');
+  pxLine(hx + d, hy, heelX + d, by, '#a8703a');                          // shaded edge for thickness
+
+  // blade: dark outline, graphite body, white tape
+  const x0 = Math.min(heelX, toeX), w = Math.abs(toeX - heelX) + 1;
+  ctx.fillStyle = OUT; ctx.fillRect(x0 - 1, by, w + 2, 4);
+  ctx.fillStyle = '#f4f1e8'; ctx.fillRect(x0, by + 1, w, 1);            // white tape on top edge
+  ctx.fillStyle = '#4a5078'; ctx.fillRect(x0, by + 2, w, 1);             // graphite blade face
+  ctx.fillStyle = OUT; ctx.fillRect(heelX - d, by - 1, 1, 1);            // heel corner joins the shaft
+
+  // butt-end knob in team colour
+  ctx.fillStyle = OUT; ctx.fillRect(hx - 2, hy - 2, 4, 3);
+  ctx.fillStyle = p.id ? '#8fd3ff' : '#ff7a59'; ctx.fillRect(hx - 1, hy - 1, 2, 1);
+}
+function drawShield(p) {
+  if (p.shield <= 0) return;
+  if (p.shield < 1 && Math.floor(S.t * 16) % 2) return;
+  const x = Math.round(p.x), y = Math.round(p.y) - 2;
+  ctx.globalAlpha = 0.22; pxDisc(ctx, x, y, 11, '#fff3a0'); ctx.globalAlpha = 1;
+  pxRing(ctx, x, y, 11, 1.2, '#ffd23f');
+  pxRing(ctx, x, y, 12, 0.5, '#fff3a0', (px, py) => ((px + py) & 1) === 0);
+  const a = S.t * 3;
+  ctx.fillStyle = '#ffffff';
+  for (let k = 0; k < 4; k++) {
+    const sx = Math.round(x + Math.cos(a + k * Math.PI / 2) * 11), sy = Math.round(y + Math.sin(a + k * Math.PI / 2) * 11);
+    ctx.fillRect(sx - 1, sy, 3, 1); ctx.fillRect(sx, sy - 1, 1, 3);
+  }
+}
+function drawPlayer(p) {
+  const x = Math.round(p.x), y = Math.round(p.y);
+  ctx.fillStyle = 'rgba(20,24,43,.28)'; ctx.fillRect(x - 5, y + 6, 11, 3);
+  const spdNow = Math.hypot(p.vx, p.vy);
+  const moving = spdNow > 14;
+  const frame = moving && (Math.abs(Math.floor(p.anim)) % 2 === 1) ? 1 : 0;
+  const spr = SPR[p.char][p.id][frame];
+  if (p.char === 2 && spdNow > 60) {                    // ninja after-images
+    ctx.globalAlpha = 0.28; blit(spr, Math.round(x - 5 - p.vx * 0.06), Math.round(y - 9 - p.vy * 0.06), p.face < 0);
+    ctx.globalAlpha = 0.14; blit(spr, Math.round(x - 5 - p.vx * 0.12), Math.round(y - 9 - p.vy * 0.12), p.face < 0);
+    ctx.globalAlpha = 1;
+  }
+  if (p.dekeT > 0) {                                    // side-step after-images
+    for (let k = 3; k >= 1; k--) {
+      ctx.globalAlpha = 0.4 / k; blit(spr, Math.round(x - 5 - p.dkx * k * 7), Math.round(y - 9 - p.dky * k * 7), p.face < 0);
+    }
+    ctx.globalAlpha = 1;
+  }
+  if (p.stun > 0 && Math.floor(S.t * 20) % 2) ctx.globalAlpha = 0.5;
+  const behind = Math.sin(p.ang) < -0.3;
+  if (behind) drawStick(p);
+  blit(spr, x - 5, y - 9, p.face < 0);
+  if (!behind) drawStick(p);
+  ctx.globalAlpha = 1;
+  drawShield(p);
+  if (p.charge > 0.04) {                                // shot power meter
+    const w = 14, x0 = x - 7, y0 = y - 17, full = p.charge >= 0.999;
+    ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x0 - 1, y0 - 1, w + 2, 5);
+    ctx.fillStyle = full ? (Math.floor(S.t * 14) % 2 ? '#ffffff' : '#ffd23f') : (p.charge > 0.66 ? '#ff7a59' : '#ffd23f');
+    ctx.fillRect(x0, y0, Math.round(w * p.charge), 3);
+  }
+}
+function drawPuddle(q) {
+  const x = Math.round(q.x), y = Math.round(q.y);
+  if (!q.landed) {                                      // flask arcing through the air
+    const k = clamp(q.age / 0.3, 0, 1);
+    const fx = Math.round(q.sx + (q.x - q.sx) * k), fy = Math.round(q.sy + (q.y - q.sy) * k - Math.sin(k * Math.PI) * 18);
+    ctx.fillStyle = '#14182b'; ctx.fillRect(fx - 2, fy - 3, 5, 6);
+    ctx.fillStyle = '#7be08a'; ctx.fillRect(fx - 1, fy - 1, 3, 3);
+    ctx.fillStyle = '#f4f1e8'; ctx.fillRect(fx - 1, fy - 3, 3, 1);
+    return;
+  }
+  if (q.t < 1 && Math.floor(S.t * 14) % 2) return;
+  const g = clamp((q.age - 0.3) / 0.15, 0.3, 1);
+  const rx = Math.round(q.r * g), ry = Math.round(q.r * 0.75 * g);
+  pxEllipse(ctx, x, y, rx + 1, ry + 1, '#0e0b1d');
+  pxEllipse(ctx, x, y, rx, ry, '#241a44');
+  pxEllipse(ctx, x, y, Math.round(rx * 0.72), Math.round(ry * 0.7), '#33265e');
+  const cols = ['#6a3fb5', '#2f9e55', '#9bf28a', '#c9a6ff'];
+  [[-8, -3], [-3, 3], [4, -5], [8, 1], [0, -1], [-6, 5], [6, 5]].forEach((o, i) => {
+    ctx.fillStyle = cols[(i + Math.floor(S.t * 4)) % 4];
+    ctx.fillRect(x + Math.round(o[0] * g), y + Math.round(o[1] * g), 2, 1);
+  });
+  ctx.fillStyle = '#9d8ae0'; ctx.fillRect(x - Math.round(rx * 0.6), y - Math.round(ry * 0.55), 3, 1);
+}
+function drawDecoy(d) {
+  const x = Math.round(d.x), y = Math.round(d.y);
+  let a = 0.8; if (d.t < 0.6 && Math.floor(S.t * 14) % 2) a = 0.35;
+  ctx.globalAlpha = a * 0.35; ctx.fillStyle = '#a67cff'; ctx.fillRect(x - 6, y - 6, 12, 12);
+  ctx.globalAlpha = a;
+  ctx.fillStyle = '#6a3fb5'; ctx.fillRect(x - 4, y - 4, 9, 8);
+  ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x - 3, y - 3, 7, 6);
+  ctx.fillStyle = '#2b2f4a'; ctx.fillRect(x - 2, y - 2, 5, 4);
+  ctx.fillStyle = '#c9a6ff'; ctx.fillRect(x - 2, y - 2, 2, 1);
+  ctx.globalAlpha = 1;
+}
+function drawGoalie(g) {
+  const x = Math.round(g.x), y = Math.round(g.y);
+  ctx.fillStyle = 'rgba(20,24,43,.28)'; ctx.fillRect(x - 5, y + 6, 11, 3);
+  if (g.stun > 0 && Math.floor(S.t * 16) % 2) ctx.globalAlpha = 0.55;
+  const side = g.team ? -1 : 1;
+  blit(GSPR[g.team], x - 5, y - 9, g.team === 1);
+  ctx.fillStyle = '#14182b'; ctx.fillRect(x - 7, y + 1, 4, 10); ctx.fillRect(x + 4, y + 1, 4, 10);
+  ctx.fillStyle = '#f4f1e8'; ctx.fillRect(x - 6, y + 2, 2, 8); ctx.fillRect(x + 5, y + 2, 2, 8);
+  ctx.fillStyle = '#14182b'; ctx.fillRect(x + side * 8 - 1, y - 3, 4, 14);
+  ctx.fillStyle = '#a8703a'; ctx.fillRect(x + side * 8, y - 2, 2, 12);
+  ctx.globalAlpha = 1;
+}
+function drawWall(w) {
+  const k = w.age < 0.15 ? w.age / 0.15 : 1;
+  let x = w.x, y = w.y, ww = w.w, hh = w.h;
+  if (k < 1) {
+    if (w.w < w.h) { hh = Math.max(2, Math.round(w.h * k)); y = w.y + (w.h - hh) / 2; }
+    else { ww = Math.max(2, Math.round(w.w * k)); x = w.x + (w.w - ww) / 2; }
+  }
+  if (w.t < 0.8 && Math.floor(S.t * 14) % 2) return;
+  x = Math.round(x); y = Math.round(y); ww = Math.round(ww); hh = Math.round(hh);
+  ctx.fillStyle = 'rgba(20,24,43,.3)'; ctx.fillRect(x + 2, y + 3, ww, hh);
+  ctx.fillStyle = '#1b4b8a'; ctx.fillRect(x - 1, y - 1, ww + 2, hh + 2);
+  ctx.fillStyle = '#6fc3ff'; ctx.fillRect(x, y, ww, hh);
+  for (let yy = 0; yy < hh; yy += 3) for (let xx = 0; xx < ww; xx += 3) {
+    if (((xx + yy) / 3) % 2 === 0) { ctx.fillStyle = '#9bdcff'; ctx.fillRect(x + xx, y + yy, Math.min(3, ww - xx), Math.min(3, hh - yy)); }
+  }
+  ctx.fillStyle = '#e6fbff'; ctx.fillRect(x, y, ww, 1); ctx.fillRect(x, y, 1, hh);
+  ctx.fillStyle = '#3d8fe0'; ctx.fillRect(x, y + hh - 1, ww, 1); ctx.fillRect(x + ww - 1, y, 1, hh);
+}
+function drawPuck() {
+  const x = Math.round(puck.x), y = Math.round(puck.y);
+  if (puck.fire) {
+    const f = Math.floor(S.t * 20) % 2;
+    ctx.fillStyle = 'rgba(255,140,40,.16)'; ctx.fillRect(x - 10, y - 10, 20, 20);
+    ctx.fillStyle = 'rgba(255,170,60,.22)'; ctx.fillRect(x - 7, y - 7, 14, 14);
+    pxDisc(ctx, x, y, 6 + f, '#c1121f');
+    pxDisc(ctx, x, y, 5, '#ff5a1f');
+    pxDisc(ctx, x, y, 3, '#ffb100');
+    pxDisc(ctx, x, y, 1, '#fff3a0');
+  } else {
+    if (puck.carrier >= 0) { ctx.fillStyle = puck.carrier ? '#8fd3ff' : '#ff7a59'; ctx.fillRect(x - 4, y + 4, 9, 1); ctx.fillRect(x - 4, y - 5, 9, 1); }
+    ctx.fillStyle = 'rgba(20,24,43,.3)'; ctx.fillRect(x - 3, y + 3, 7, 2);
+    ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x - 3, y - 3, 7, 6);
+    ctx.fillStyle = '#2b2f4a'; ctx.fillRect(x - 2, y - 2, 5, 4);
+    ctx.fillStyle = '#8b93b8'; ctx.fillRect(x - 2, y - 2, 2, 1);
+  }
+}
+function drawParticles() {
+  for (const p of particles) {
+    const f = p.life / p.max;
+    const col = p.cols[Math.min(p.cols.length - 1, Math.floor((1 - f) * p.cols.length))];
+    const s = Math.max(1, Math.round(p.size * (p.shrink ? f : 1)));
+    ctx.fillStyle = col;
+    ctx.fillRect(Math.round(p.x - s / 2), Math.round(p.y - s / 2), s, s);
+  }
+  for (const t of texts) txt(t.s, t.x, t.y, 8, t.col, 'center');
+}
+
+function manaBar(p, x, y, cols) {
+  const full = p.mana >= 0.999;
+  ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x, y, 124, 12);
+  ctx.fillStyle = p.id ? '#2a6fdb' : '#d62839';
+  ctx.fillRect(x, y, 124, 2); ctx.fillRect(x, y + 10, 124, 2); ctx.fillRect(x, y, 2, 12); ctx.fillRect(x + 122, y, 2, 12);
+  const n = p.mana * 10, flash = full && Math.floor(S.t * 8) % 2;
+  for (let i = 0; i < 10; i++) {
+    const sx = x + 2 + i * 12 + 0;
+    if (i < Math.floor(n) || full) {
+      ctx.fillStyle = flash ? '#ffffff' : cols[Math.min(cols.length - 1, Math.floor(i / 10 * cols.length))];
+      ctx.fillRect(sx, y + 3, 11, 6);
+      ctx.fillStyle = 'rgba(255,255,255,.35)'; ctx.fillRect(sx, y + 3, 11, 1);
+    } else if (i === Math.floor(n)) {
+      ctx.fillStyle = cols[Math.min(cols.length - 1, Math.floor(i / 10 * cols.length))];
+      ctx.globalAlpha = 0.35 + (n - i) * 0.5;
+      ctx.fillRect(sx, y + 3, Math.max(2, Math.round(11 * (n - i))), 6);
+      ctx.globalAlpha = 1;
+    }
+  }
+}
+function fmtTime() {
+  const s = Math.max(0, Math.ceil(S.time));
+  return Math.floor(s / 60) + ':' + (s % 60 < 10 ? '0' : '') + (s % 60);
+}
+function drawHUD() {
+  ctx.fillStyle = '#14182b'; ctx.fillRect(0, 0, W, 32);
+  ctx.fillStyle = '#2b3158'; ctx.fillRect(0, 0, W, 2);
+  ctx.fillStyle = '#d62839'; ctx.fillRect(0, 30, 240, 2);
+  ctx.fillStyle = '#2a6fdb'; ctx.fillRect(240, 30, 240, 2);
+
+  txt(CH[P[0].char].short, 8, 4, 8, '#ff7a59');
+  txt(CH[P[1].char].short, 472, 4, 8, '#8fd3ff', 'right');
+  manaBar(P[0], 8, 16, CH[P[0].char].mana);
+  manaBar(P[1], 348, 16, CH[P[1].char].mana);
+
+  const blink = Math.floor(S.t * 4) % 2;
+  if (S.mode === 'play' || S.mode === 'paused') {
+    const st = (p, x, al) => {
+      if (p.noPuck > 0) txt('NEED PUCK', x, 4, 8, '#ff5a5f', al);
+      else if (p.mana >= 0.999) txt('READY!', x, 4, 8, blink ? '#ffd23f' : '#ffffff', al);
+    };
+    st(P[0], 132, 'right'); st(P[1], 348, 'left');
+  }
+
+  // score boxes
+  const box = (x, col, n) => {
+    ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x, 3, 52, 25);
+    ctx.fillStyle = col; ctx.fillRect(x + 2, 5, 48, 21);
+    txt(String(n), x + 26, 8, 16, '#ffffff', 'center');
+  };
+  box(138, '#d62839', S.score[0]);
+  box(290, '#2a6fdb', S.score[1]);
+  // timer
+  ctx.fillStyle = '#ffd23f'; ctx.fillRect(196, 3, 88, 25);
+  ctx.fillStyle = '#0b0d1a'; ctx.fillRect(198, 5, 84, 21);
+  const low = !S.ot && S.time <= 10 && S.time > 0 && S.mode !== 'title';
+  txt(S.ot ? 'OT' : fmtTime(), 240, 8, 16, S.ot ? '#ff5a5f' : (low && blink ? '#ff5a5f' : '#ffd23f'), 'center');
+}
+
+function drawTabs() {
+  [['PLAY', 20], ['FIGHTER', 120], ['CONTROLS', 220], ['BADGES', 320]].forEach((t, i) => {
+    const on = S.tab === i, x = t[1];
+    ctx.fillStyle = on ? '#ffd23f' : '#2b3158'; ctx.fillRect(x, 4, 96, 21);
+    ctx.fillStyle = on ? '#14182b' : '#0f1224'; ctx.fillRect(x + 2, 6, 92, 19);
+    txt(t[0], x + 48, 11, 8, on ? '#ffd23f' : '#7f8bb5', 'center');
+  });
+  ctx.fillStyle = '#2b3158'; ctx.fillRect(0, 25, W, 2);
+  txt('LV ' + PROFILE.level, 472, 5, 8, '#8fd3ff', 'right');
+  txt(achCount() + '/' + ACH.length, 472, 15, 8, '#ffd23f', 'right');
+}
+function pips(x, y, n, col) {
+  for (let i = 0; i < 5; i++) {
+    ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x + i * 14, y, 12, 8);
+    ctx.fillStyle = i < n ? col : '#2b3158'; ctx.fillRect(x + i * 14 + 1, y + 1, 10, 6);
+    if (i < n) { ctx.fillStyle = 'rgba(255,255,255,.35)'; ctx.fillRect(x + i * 14 + 1, y + 1, 10, 1); }
+  }
+}
+function roleLabel(id) {
+  if (NET.role) return id === NET.me ? 'YOU' : 'OPPONENT';
+  if (S.cpu) return id === S.cpuId ? 'CPU - ' + DIFF[S.level].name : 'YOU';
+  return 'PLAYER ' + (id + 1);
+}
+function drawTitle() {
+  ctx.fillStyle = S.tab !== 0 ? 'rgba(11,13,26,.97)' : 'rgba(11,13,26,.84)'; ctx.fillRect(0, 0, W, H);
+  drawTabs();
+  if (S.tab === 3) { drawAchTab(); return; }
+  if (S.tab === 2) { drawControlsTab(); return; }
+  if (S.tab === 1) { drawFighterTab(); return; }
+
+  const cols = ['#ff5a1f', '#ffb100', '#ffd23f'];
+  const c = cols[Math.floor(Math.abs(S.t) * 5) % 3];
+  txt('SPELLBLADE', 240, 34, 32, c, 'center', '#7a1a1a');
+  txt('HOCKEY', 240, 72, 24, '#8fd3ff', 'center', '#1b4b8a');
+  const bob = Math.round(Math.sin(S.t * 3) * 2);
+  const tf = Math.abs(Math.floor(S.t * 4)) % 2;
+  blit(SPR[S.chars[0]][0][tf], 40, 38 + bob, false, 3);
+  blit(SPR[S.chars[1]][1][tf], 407, 38 - bob, true, 3);
+
+  const rows = [
+    'MODE: ' + (S.cpu ? '1 PLAYER VS CPU' : '2 PLAYERS'),
+    'YOU PLAY: ' + (S.cpuId === 1 ? 'RED TEAM' : 'BLUE TEAM'),
+    'CPU LEVEL: ' + DIFF[S.level].name
+  ];
+  rows.forEach((str, i) => {
+    const y = 108 + 14 * i, dim = !S.cpu && i > 0, sel = S.menuRow === i;
+    const col = dim ? '#5b6590' : (sel ? '#ffd23f' : '#e4f7ff');
+    txt(str, 240, y, 8, col, 'center');
+    if (sel) {
+      txt('>', 240 - str.length * 4 - 18, y, 8, col, 'left');
+      txt('<', 240 + str.length * 4 + 10, y, 8, col, 'left');
+    }
+  });
+  const bl3 = Math.floor(S.t * 3) % 2;
+  txt('[ START ]', 170, 156, 8, bl3 ? '#ffffff' : '#ffd23f', 'center');
+  txt('[ ONLINE ]', 310, 156, 8, bl3 ? '#8fd3ff' : '#ffffff', 'center');
+
+  // the two chosen fighters
+  const card = (id, x) => {
+    const ch = CH[S.chars[id]];
+    const team = id ? '#2a6fdb' : '#d62839', light = id ? '#8fd3ff' : '#ff7a59';
+    ctx.fillStyle = '#14182b'; ctx.fillRect(x, 176, 210, 62);
+    ctx.fillStyle = team;
+    ctx.fillRect(x, 176, 210, 2); ctx.fillRect(x, 236, 210, 2); ctx.fillRect(x, 176, 2, 62); ctx.fillRect(x + 208, 176, 2, 62);
+    blit(SPR[S.chars[id]][id][0], x + 8, 186, id === 1, 3);
+    let tag, l1, l2, l3 = '';
+    if (S.cpu && S.cpuId === id) { tag = 'CPU'; l1 = 'AI CONTROLLED'; l2 = 'LEVEL: ' + DIFF[S.level].name; }
+    else {
+      const kb = BIND[id];
+      tag = S.cpu ? 'YOU' : 'P' + (id + 1);
+      l1 = S.cpu ? 'MOVE ' + moveLabel(BIND[0]) + '/' + moveLabel(BIND[1]) : 'MOVE ' + moveLabel(kb);
+      l2 = 'SPELL ' + keyShort(kb.sp) + ' SHOT ' + keyShort(kb.s);
+      l3 = 'SKILL ' + keyShort(kb.sk) + ' 2X=SPIN';
+      l1 = l1.slice(0, 19); l2 = l2.slice(0, 19); l3 = l3.slice(0, 19);
+    }
+    txt(ch.name, x + 52, 182, 8, ch.col);
+    txt(tag, x + 202, 182, 8, light, 'right');
+    txt(ch.spellName, x + 52, 192, 8, '#e4f7ff');
+    txt(l1, x + 52, 203, 8, '#b8c4ee');
+    txt(l2, x + 52, 213, 8, '#b8c4ee');
+    if (l3) txt(l3, x + 52, 223, 8, '#b8c4ee');
+  };
+  card(0, 16); card(1, 254);
+
+  txt('TAB = FIGHTERS, CONTROLS, BADGES', 240, 248, 8, '#ffb100', 'center');
+  txt('UP/DOWN PICK - LEFT/RIGHT CHANGE', 240, 262, 8, '#7f8bb5', 'center');
+  txt('1/2 QUICK START  O ONLINE  P PAUSE  F FULL', 240, 276, 8, '#5b6590', 'center');
+}
+function drawLock(x, y, col) {                       // 10x11 pixel padlock
+  ctx.fillStyle = col; ctx.fillRect(x, y + 5, 10, 7); ctx.fillRect(x + 2, y, 2, 6); ctx.fillRect(x + 6, y, 2, 6); ctx.fillRect(x + 2, y, 6, 2);
+  ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x + 4, y + 7, 2, 3);
+}
+function drawSelPanel(id, px) {                      // drawn with a -8 y translate: screen y 32..208
+  const cur = fcur(id), c = CH[cur], lockedNow = isLocked(id, cur);
+  const team = id ? '#2a6fdb' : '#d62839', light = id ? '#8fd3ff' : '#ff7a59';
+  const active = S.cpu ? S.fAct === id : true;
+  ctx.fillStyle = '#14182b'; ctx.fillRect(px, 40, 226, 176);
+  ctx.fillStyle = active ? team : '#2b3158';
+  ctx.fillRect(px, 40, 226, 3); ctx.fillRect(px, 213, 226, 3); ctx.fillRect(px, 40, 3, 176); ctx.fillRect(px + 223, 40, 3, 176);
+  txt(roleLabel(id) + (id ? ' - BLUE' : ' - RED'), px + 113, 47, 8, light, 'center');
+  for (let i = 0; i < CH.length; i++) {
+    const sx = px + 8 + i * 42, isCur = cur === i, isPick = S.chars[id] === i, lk = isLocked(id, i);
+    ctx.fillStyle = isCur ? (active ? '#ffd23f' : '#8b93b8') : (isPick ? team : '#2b3158');
+    ctx.fillRect(sx, 60, 40, 38);
+    ctx.fillStyle = '#0b0d1a'; ctx.fillRect(sx + 2, 62, 36, 34);
+    ctx.globalAlpha = lk ? 0.25 : (isCur ? 1 : 0.5);
+    blit(SPR[i][id][isCur && !lk ? Math.abs(Math.floor(S.t * 3)) % 2 : 0], sx + 9, 64, id === 1, 2);
+    ctx.globalAlpha = 1;
+    if (lk) { drawLock(sx + 15, 69, '#c9d4ff'); txt('LV' + UNLOCK_LEVEL[i], sx + 20, 86, 8, '#ffb100', 'center'); }
+  }
+  txt(c.name, px + 113, 104, 8, lockedNow ? '#7f8bb5' : c.col, 'center');
+  txt('SPEED', px + 10, 115, 8, '#b8c4ee'); pips(px + 78, 114, c.spdPips, lockedNow ? '#5a63a0' : light);
+  txt('SHOT POW', px + 10, 126, 8, '#b8c4ee'); pips(px + 78, 125, c.powPips, lockedNow ? '#5a63a0' : light);
+  txt('MANA REG', px + 10, 137, 8, '#b8c4ee'); pips(px + 78, 136, c.regenPips, lockedNow ? '#5a63a0' : light);
+  txt('CHECK', px + 10, 148, 8, '#b8c4ee'); pips(px + 78, 147, c.chkPips, lockedNow ? '#5a63a0' : light);
+  if (lockedNow) { drawLock(px + 181, 112, '#ff5a5f'); txt('LEVEL ' + UNLOCK_LEVEL[cur], px + 186, 127, 8, '#ff5a5f', 'center'); }
+  else { txt(S.chars[id] === cur ? 'READY' : '', px + 186, 127, 8, '#7be08a', 'center'); }
+  txt(c.tag, px + 113, 160, 8, '#e4f7ff', 'center');
+  txt('SPECIAL: ' + c.spellName, px + 113, 171, 8, c.col, 'center');
+  txt(c.l1, px + 113, 182, 8, '#b8c4ee', 'center');
+  txt(c.l2, px + 113, 193, 8, '#b8c4ee', 'center');
+  const blink = Math.floor(S.t * 3) % 2;
+  let status;
+  if (lockedNow) status = 'LOCKED - REACH LEVEL ' + UNLOCK_LEVEL[cur];
+  else if (S.cpu) status = active ? 'LEFT/RIGHT TO CHANGE' : 'UP/DOWN TO SWITCH HERE';
+  else status = id ? 'LEFT/RIGHT TO CHANGE' : 'A / D TO CHANGE';
+  txt(status, px + 113, 204, 8, lockedNow ? (blink ? '#ff5a5f' : '#ffb100') : (active ? (blink ? '#ffd23f' : '#e4f7ff') : '#8b93b8'), 'center');
+}
+const ACH_ROWS = 7;
+function achScroll(d) { S.achScroll = clamp((S.achScroll || 0) + d, 0, Math.max(0, ACH.length - ACH_ROWS)); }
+function achClick(x, y) {
+  if (x >= 466 && x < 480 && y >= 44 && y < 238) { achScroll(y < 141 ? -3 : 3); sfx('tick'); return; }   // scrollbar track
+  if (x >= 330 && x < 476 && y >= 270 && y < 292) {
+    if (S.achConfirm && S.t < S.achConfirm) { ACH_SAVED = {}; LIFE.matches = 0; LIFE.goals = 0; saveAch(); saveLife(); S.achConfirm = 0; toast('PROGRESS ERASED'); sfx('deny'); }
+    else { S.achConfirm = S.t + 3; sfx('tick'); }
+  }
+}
+function drawAchTab() {
+  const n = achCount(), top = clamp(S.achScroll || 0, 0, Math.max(0, ACH.length - ACH_ROWS));
+  txt('ACHIEVEMENTS', 14, 33, 8, '#8fd3ff');
+  txt(n + ' / ' + ACH.length + ' UNLOCKED', 466, 33, 8, n === ACH.length ? '#ffd23f' : '#b8c4ee', 'right');
+  for (let i = 0; i < ACH_ROWS && top + i < ACH.length; i++) {
+    const a = ACH[top + i], y = 46 + 27 * i, got = !!ACH_SAVED[a.id];
+    ctx.fillStyle = got ? '#ffd23f' : '#2b3158'; ctx.fillRect(12, y, 450, 25);
+    ctx.fillStyle = got ? '#1b2040' : '#14182b'; ctx.fillRect(14, y + 2, 446, 21);
+    ctx.fillStyle = '#0b0d1a'; ctx.fillRect(16, y, 26, 25); ctx.fillStyle = got ? '#2b3158' : '#1b2040'; ctx.fillRect(17, y + 1, 24, 23);
+    drawIcon(a.id, 17, y + 1, 2, !got);
+    txt(a.name, 48, y + 4, 8, got ? '#ffd23f' : '#7f8bb5');
+    txt(a.desc, 48, y + 14, 8, got ? '#e4f7ff' : '#5b6590');
+    const st = got ? 'UNLOCKED' : (a.prog ? a.prog() : 'LOCKED');
+    txt(st, 456, y + 9, 8, got ? '#7be08a' : (a.prog ? '#8fd3ff' : '#5b6590'), 'right');
+  }
+  if (ACH.length > ACH_ROWS) {                              // scrollbar
+    const th = Math.max(18, Math.round(189 * ACH_ROWS / ACH.length)), ty = 46 + Math.round((189 - th) * top / (ACH.length - ACH_ROWS));
+    ctx.fillStyle = '#0b0d1a'; ctx.fillRect(469, 46, 8, 189);
+    ctx.fillStyle = '#2b3158'; ctx.fillRect(470, 47, 6, 187);
+    ctx.fillStyle = '#ffd23f'; ctx.fillRect(470, ty + 1, 6, th - 2);
+  }
+  const bw = 240, f = n / ACH.length;
+  ctx.fillStyle = '#0b0d1a'; ctx.fillRect(14, 240, bw + 4, 12);
+  ctx.fillStyle = '#2b3158'; ctx.fillRect(16, 242, bw, 8);
+  ctx.fillStyle = '#ffd23f'; ctx.fillRect(16, 242, Math.round(bw * f), 8);
+  ctx.fillStyle = 'rgba(255,255,255,.35)'; ctx.fillRect(16, 242, Math.round(bw * f), 2);
+  txt(Math.round(f * 100) + '%', 266, 242, 8, '#ffd23f');
+  txt('SPACE = START MATCH   ESC = BACK', 14, 262, 8, Math.floor(S.t * 2) % 2 ? '#ffffff' : '#ffd23f');
+  if (ACH.length > ACH_ROWS) txt('SCROLL: UP/DOWN/WHEEL', 466, 262, 8, '#7f8bb5', 'right');
+  txt('SAVED ON THIS BROWSER. HUMANS ONLY', 14, 278, 8, '#5b6590');
+  const conf = S.achConfirm && S.t < S.achConfirm;
+  txt(conf ? 'CLICK AGAIN TO ERASE' : 'RESET PROGRESS', 470, 282, 8, conf ? '#ff5a5f' : '#3a4175', 'right');
+  if (S.toast && S.t < S.toastUntil) txt(S.toast, 466, 244, 8, '#ffd23f', 'right');
+}
+function drawControlsTab() {
+  const blink = Math.floor(S.t * 3) % 2, sel = cs();
+  [0, 1].forEach(col => {
+    const px = col ? 244 : 10, team = col ? '#2a6fdb' : '#d62839', light = col ? '#8fd3ff' : '#ff7a59';
+    ctx.fillStyle = '#14182b'; ctx.fillRect(px, 34, 226, 148);
+    ctx.fillStyle = team; ctx.fillRect(px, 34, 226, 3); ctx.fillRect(px, 179, 226, 3); ctx.fillRect(px, 34, 3, 148); ctx.fillRect(px + 223, 34, 3, 148);
+    txt(col ? 'PLAYER 2 - BLUE' : 'PLAYER 1 - RED', px + 113, 40, 8, light, 'center');
+    ACTIONS.forEach((a, i) => {
+      const ry = 54 + 18 * i, on = sel.col === col && sel.row === i, wait = S.rebind && S.rebind.col === col && S.rebind.row === i;
+      txt(a[1], px + 10, ry + 3, 8, on ? '#ffd23f' : '#b8c4ee');
+      ctx.fillStyle = on ? '#ffd23f' : '#2b3158'; ctx.fillRect(px + 134, ry, 82, 14);
+      ctx.fillStyle = '#0b0d1a'; ctx.fillRect(px + 136, ry + 2, 78, 10);
+      txt(wait ? (blink ? 'PRESS KEY' : '') : keyLabel(BIND[col][a[0]]), px + 175, ry + 3, 8, wait ? '#ffd23f' : '#e4f7ff', 'center');
+    });
+  });
+  const on = sel.row === 7, b = { x: 150, y: 192, w: 180, h: 22 };
+  ctx.fillStyle = '#0b0d1a'; ctx.fillRect(b.x + 3, b.y + 4, b.w, b.h);
+  ctx.fillStyle = '#14182b'; ctx.fillRect(b.x - 2, b.y - 2, b.w + 4, b.h + 4);
+  ctx.fillStyle = on ? '#ffd23f' : '#3a4175'; ctx.fillRect(b.x, b.y, b.w, b.h);
+  ctx.fillStyle = on ? '#fff3a0' : '#5a63a0'; ctx.fillRect(b.x, b.y, b.w, 3); ctx.fillRect(b.x, b.y, 3, b.h);
+  ctx.fillStyle = on ? '#c9a227' : '#262b52'; ctx.fillRect(b.x, b.y + b.h - 3, b.w, 3); ctx.fillRect(b.x + b.w - 3, b.y, 3, b.h);
+  txt('RESET TO DEFAULT', b.x + b.w / 2, b.y + 7, 8, on ? '#14182b' : '#e4f7ff', 'center');
+  if (S.rebind) txt('PRESS A KEY OR CLICK A MOUSE BUTTON - ESC CANCELS', 240, 228, 8, blink ? '#ffd23f' : '#ffffff', 'center');
+  else txt('CLICK A KEY, OR ARROWS + ENTER, TO CHANGE IT', 240, 228, 8, '#b8c4ee', 'center');
+  txt('A KEY ALREADY IN USE SWAPS PLACES. 1P: EITHER SET WORKS', 240, 241, 8, '#7f8bb5', 'center');
+  txt('SPELL / SHOOT / SKILL CAN USE MOUSE BUTTONS (1 PLAYER)', 240, 268, 8, '#5b6590', 'center');
+  if (S.toast && S.t < S.toastUntil) txt(S.toast, 240, 254, 8, '#ffd23f', 'center');
+  txt('R = RESET   TAB / ESC = BACK   SAVED ON THIS BROWSER', 240, 282, 8, '#5b6590', 'center');
+}
+function drawFighterTab() {
+  ctx.save(); ctx.translate(0, -8);
+  drawSelPanel(0, 10);
+  drawSelPanel(1, 244);
+  ctx.restore();
+  if (S.cpu) {
+    txt('EDITING: ' + (S.fAct === S.cpuId ? 'CPU OPPONENT' : 'YOUR FIGHTER'), 240, 220, 8, '#ffd23f', 'center');
+    txt('LEFT/RIGHT CHANGE - UP/DOWN SWITCH - R RANDOM', 240, 234, 8, '#b8c4ee', 'center');
+  } else {
+    txt('P1: A/D CHANGE     P2: LEFT/RIGHT CHANGE', 240, 220, 8, '#ffd23f', 'center');
+    txt('BOTH PLAYERS CAN PICK AT THE SAME TIME', 240, 234, 8, '#b8c4ee', 'center');
+  }
+  const li = levelInfo(PROFILE.xp), nxt = CH.findIndex((c, i) => !PROFILE.unlocked[i]);
+  if (S.toast && S.t < S.toastUntil) txt(S.toast, 240, 246, 8, '#ff5a5f', 'center');
+  else txt('LEVEL ' + li.level + (li.need ? '  ' + li.into + '/' + li.need + ' XP' : '  MAX') + (nxt >= 0 ? '  NEXT: ' + CH[nxt].short + ' AT LV' + UNLOCK_LEVEL[nxt] : '  ALL UNLOCKED'), 240, 246, 8, '#8fd3ff', 'center');
+  txt('SPACE = START MATCH   ESC = BACK', 240, 258, 8, Math.floor(S.t * 2) % 2 ? '#ffffff' : '#ffd23f', 'center');
+  txt('YOU CAN CLICK THE PORTRAITS TOO', 240, 276, 8, '#5b6590', 'center');
+}
+function easeOut(t) { t = clamp(t, 0, 1); return 1 - Math.pow(1 - t, 3); }
+function drawIntro() {
+  const t = S.introT;
+  ctx.fillStyle = '#0f1224'; ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  if (t > 0.45 && t < 0.62) ctx.translate(Math.round(rnd(-2, 2)), Math.round(rnd(-2, 2)));
+  // diagonal red / blue split
+  for (let y = 0; y < H; y += 4) {
+    const bx = Math.round(240 + (y - 150) * 0.18), alt = (y / 4) % 2;
+    ctx.fillStyle = alt ? '#2b0d14' : '#33101a'; ctx.fillRect(0, y, bx, 4);
+    ctx.fillStyle = alt ? '#0d1b38' : '#10234a'; ctx.fillRect(bx, y, W - bx, 4);
+    ctx.fillStyle = '#f4f1e8'; ctx.fillRect(bx - 1, y, 2, 4);
+  }
+  ctx.fillStyle = '#14182b'; ctx.fillRect(0, 0, W, 20);
+  txt('MATCH START', 240, 6, 8, '#ffd23f', 'center');
+
+  const off = (1 - easeOut(t / 0.5)) * 170;
+  const side = id => {
+    const c = CH[S.chars[id]];
+    const cx = id ? 360 + off : 120 - off;
+    const team = id ? '#2a6fdb' : '#d62839', light = id ? '#8fd3ff' : '#ff7a59';
+    txt(roleLabel(id), cx, 25, 8, light, 'center');
+    ctx.fillStyle = team; ctx.fillRect(cx - 58, 36, 116, 122);
+    ctx.fillStyle = '#0b0d1a'; ctx.fillRect(cx - 56, 38, 112, 118);
+    pxEllipse(ctx, Math.round(cx), 148, 34, 4, '#1b2040');
+    const bob = Math.round(Math.sin(S.t * 4 + id) * 2);
+    blit(SPR[S.chars[id]][id][Math.abs(Math.floor(S.t * 3)) % 2], Math.round(cx - 44), 40 + bob, id === 1, 8);
+    if (t > 0.45) {
+      txt(c.name, cx, 166, 16, c.col, 'center');
+      txt('SPECIAL: ' + c.spellName, cx, 188, 8, '#e4f7ff', 'center');
+      txt(c.l1, cx, 202, 8, '#b8c4ee', 'center');
+      txt(c.l2, cx, 214, 8, '#b8c4ee', 'center');
+      txt('SPEED', cx - 86, 232, 8, '#b8c4ee'); pips(cx - 30, 231, c.spdPips, light);
+      txt('CHECK', cx - 86, 246, 8, '#b8c4ee'); pips(cx - 30, 245, c.chkPips, light);
+    }
+  };
+  side(0); side(1);
+  if (t > 0.35) txt('VS', 240, 84, t < 0.65 ? 48 : 32, Math.floor(t * 12) % 2 && t < 0.9 ? '#ffffff' : '#ffd23f', 'center', '#7a1a1a');
+  ctx.restore();
+  if (t > 0.45) txt('FIRST TO ' + SCORE_LIMIT + ' GOALS OR MOST WHEN TIME RUNS OUT', 240, 262, 8, '#ffb100', 'center');
+  if (t > 0.5 && Math.floor(S.t * 2) % 2) txt('PRESS SPACE TO SKIP', 240, 276, 8, '#ffffff', 'center');
+}
+const RES_BTN = [
+  { x: 64, y: 246, w: 160, h: 24, label: 'REMATCH' },
+  { x: 256, y: 246, w: 160, h: 24, label: 'MAIN MENU' }
+];
+function btnAt(x, y) {
+  for (let i = 0; i < RES_BTN.length; i++) {
+    const b = RES_BTN[i];
+    if (x >= b.x && x < b.x + b.w && y >= b.y && y < b.y + b.h) return i;
+  }
+  return -1;
+}
+function drawXpBlock(t, blink) {
+  const r = S.xpRes; if (!r) return;
+  const T0 = 1.2; if (t < T0 - 0.25) return;
+  const dur = clamp(0.9 + r.gain / 140, 1.2, 3.4);
+  const shown = r.before + r.gain * easeOut((t - T0) / dur);
+  const li = levelInfo(shown), done = t >= T0 + dur;
+  if (li.level > S.xpLv) { S.xpLv = li.level; S.lvFlash = S.t; sfx('level'); }          // ding on every level crossed
+  const flash = S.t - S.lvFlash < 1.3;
+  const it = r.items;
+  let line = 'GOALS +' + it.goals + '  SAVES +' + it.saves + '  MOVES +' + it.moves + '  RESULT +' + it.result, col = '#b8c4ee';
+  if (flash) { line = 'LEVEL UP!  YOU ARE LEVEL ' + li.level; col = blink ? '#ffd23f' : '#ffffff'; }
+  else if (done && r.newly.length) { line = 'NEW FIGHTER: ' + CH[r.newly[Math.floor((t - T0 - dur) / 1.4) % r.newly.length]].name + '!'; col = blink ? '#7be08a' : '#ffffff'; }
+  txt(line, 240, 211, 8, col, 'center');
+  const bx = 82, by = 223, bw = 290, frac = li.need ? li.into / li.need : 1;
+  txt('LV ' + li.level, 36, 226, 8, '#ffd23f');
+  ctx.fillStyle = '#0b0d1a'; ctx.fillRect(bx, by, bw, 14);
+  ctx.fillStyle = '#2b3158'; ctx.fillRect(bx + 2, by + 2, bw - 4, 10);
+  ctx.fillStyle = flash && blink ? '#ffffff' : '#ffd23f'; ctx.fillRect(bx + 2, by + 2, Math.round((bw - 4) * frac), 10);
+  ctx.fillStyle = 'rgba(255,255,255,.35)'; ctx.fillRect(bx + 2, by + 2, Math.round((bw - 4) * frac), 2);
+  txt(li.need ? Math.floor(li.into) + ' / ' + li.need : 'MAX LEVEL', bx + bw / 2, by + 3, 8, '#ffffff', 'center', '#14182b');
+  txt('+' + r.gain + ' XP', 444, 226, 8, '#7be08a', 'right');
+}
+function drawResults() {
+  const t = S.t - S.overAt;
+  ctx.fillStyle = 'rgba(11,13,26,.9)'; ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  ctx.translate(0, Math.round((1 - easeOut(t / 0.35)) * -300));       // slides down from the top
+  const win = S.winner;
+  const col = win < 0 ? '#ffd23f' : (win === 0 ? '#d62839' : '#2a6fdb');
+  const blink = Math.floor(S.t * 3) % 2;
+
+  // pixel box: dark outline, gold frame, panel
+  ctx.fillStyle = '#0b0d1a'; ctx.fillRect(20, 6, 440, 288);
+  ctx.fillStyle = '#ffd23f'; ctx.fillRect(22, 8, 436, 284);
+  ctx.fillStyle = '#14182b'; ctx.fillRect(25, 11, 430, 278);
+  ctx.fillStyle = col; ctx.fillRect(25, 11, 430, 28);
+  ctx.fillStyle = 'rgba(255,255,255,.2)'; ctx.fillRect(25, 11, 430, 2);
+  txt('FULL TIME', 240, 17, 16, '#ffffff', 'center', '#14182b');
+  txt(S.endReason || '', 240, 44, 8, '#ffd23f', 'center');
+
+  // final score
+  const sb = (id, x) => {
+    const c = CH[S.chars[id]], team = id ? '#2a6fdb' : '#d62839';
+    const tag = NET.role ? (id === NET.me ? 'YOU' : 'OPP') : S.cpu ? (id === S.cpuId ? 'CPU' : 'YOU') : 'P' + (id + 1);
+    ctx.fillStyle = win === id ? '#ffd23f' : '#0b0d1a'; ctx.fillRect(x - 3, 55, 174, 60);
+    ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x - 1, 57, 170, 56);
+    ctx.fillStyle = team; ctx.fillRect(x, 58, 168, 54);
+    blit(SPR[S.chars[id]][id][0], x + 8, 64, id === 1, 3);
+    txt(String(S.score[id]), x + 118, 72, 32, '#ffffff', 'center', '#14182b');
+    txt(tag + ' ' + c.name, x + 84, 120, 8, '#e4f7ff', 'center');
+  };
+  sb(0, 36); sb(1, 276);
+  txt('-', 240, 72, 32, '#7f8bb5', 'center');
+  if (win < 0) txt('DRAW GAME', 240, 132, 8, blink ? '#ffd23f' : '#ffffff', 'center');
+  else txt('WINNER!', win ? 360 : 120, 132, 8, blink ? '#ffd23f' : '#ffffff', 'center');
+
+  // match stats
+  const rows = [
+    ['SHOTS / ON GOAL', s => s.shots + ' / ' + s.onGoal, s => s.shots],
+    ['GOALS', s => s.goals, s => s.goals],
+    ['SAVES', s => s.saves, s => s.saves],
+    ['SPELLS CAST', s => s.spells, s => s.spells],
+    ['HITS / CHECKS', s => s.hits, s => s.hits]
+  ];
+  rows.forEach((r, i) => {
+    if (t < 0.4 + 0.12 * i) return;                                  // rows reveal one by one
+    const y = 147 + 12 * i;
+    ctx.fillStyle = i % 2 ? '#181d36' : '#1d2342'; ctx.fillRect(36, y - 2, 408, 11);
+    const a = r[2](stats[0]), b = r[2](stats[1]);
+    txt(String(r[1](stats[0])), 120, y, 8, a > b ? '#ffd23f' : '#e4f7ff', 'center');
+    txt(r[0], 240, y, 8, '#b8c4ee', 'center');
+    txt(String(r[1](stats[1])), 360, y, 8, b > a ? '#ffd23f' : '#e4f7ff', 'center');
+  });
+
+  drawXpBlock(t, blink);
+
+  // buttons
+  const ready = t >= RES_READY;
+  RES_BTN.forEach((b, i) => {
+    const sel = S.resSel === i;
+    ctx.globalAlpha = ready ? 1 : 0.35;
+    ctx.fillStyle = '#0b0d1a'; ctx.fillRect(b.x + 3, b.y + 4, b.w, b.h);
+    ctx.fillStyle = '#14182b'; ctx.fillRect(b.x - 2, b.y - 2, b.w + 4, b.h + 4);
+    ctx.fillStyle = sel ? '#ffd23f' : '#3a4175'; ctx.fillRect(b.x, b.y, b.w, b.h);
+    ctx.fillStyle = sel ? '#fff3a0' : '#5a63a0'; ctx.fillRect(b.x, b.y, b.w, 3); ctx.fillRect(b.x, b.y, 3, b.h);
+    ctx.fillStyle = sel ? '#c9a227' : '#262b52'; ctx.fillRect(b.x, b.y + b.h - 3, b.w, 3); ctx.fillRect(b.x + b.w - 3, b.y, 3, b.h);
+    txt(b.label, b.x + b.w / 2, b.y + 8, 8, sel ? '#14182b' : '#e4f7ff', 'center', sel ? null : '#14182b');
+    if (sel && ready) { txt('>', b.x + 10, b.y + 8, 8, '#14182b', 'left', null); txt('<', b.x + b.w - 18, b.y + 8, 8, '#14182b', 'left', null); }
+    ctx.globalAlpha = 1;
+  });
+  if (NET.role === 'guest') txt(NET.rem ? 'WAITING FOR HOST TO START REMATCH...' : 'R = ASK FOR A REMATCH   ESC = LEAVE', 240, 278, 8, NET.rem ? '#ffd23f' : '#5b6590', 'center');
+  else if (NET.role) txt(S.remReq ? 'OPPONENT WANTS A REMATCH! PRESS R' : 'R REMATCH   ESC = LEAVE', 240, 278, 8, S.remReq ? (blink ? '#ffd23f' : '#ffffff') : '#5b6590', 'center');
+  else txt('R REMATCH  ESC MENU  C CHANGE FIGHTERS', 240, 278, 8, '#5b6590', 'center');
+  ctx.restore();
+}
+// how-to-play strip (shown during the face-off countdown and on the pause screen)
+function drawControls(y) {
+  const L1 = keyLabel;
+  if (S.cpu || NET.role) {
+    const a = BIND[0], b = BIND[1];
+    txt(('MOVE: ' + moveLabel(a) + ' OR ' + moveLabel(b) + '   SPELL: ' + L1(a.sp) + ' OR ' + L1(b.sp)).slice(0, 58), 240, y, 8, '#e4f7ff', 'center');
+    txt(('HOLD ' + L1(a.s) + ' OR ' + L1(b.s) + ' TO CHARGE - RELEASE TO SHOOT').slice(0, 58), 240, y + 12, 8, '#ffd23f', 'center');
+    txt((L1(a.sk) + ' OR ' + L1(b.sk) + ' = DEKE   TAP TWICE = SPIN-O-RAMA').slice(0, 58), 240, y + 24, 8, '#8fd3ff', 'center');
+  } else {
+    [[0, 120, '#ff7a59'], [1, 360, '#8fd3ff']].forEach(r => {
+      const k = BIND[r[0]];
+      txt(('P' + (r[0] + 1) + ' ' + moveLabel(k) + ' MOVE').slice(0, 29), r[1], y, 8, r[2], 'center');
+      txt((L1(k.sp) + ' = SPELL').slice(0, 29), r[1], y + 10, 8, '#e4f7ff', 'center');
+      txt(('HOLD ' + L1(k.s) + ' = CHARGE SHOT').slice(0, 29), r[1], y + 20, 8, '#ffd23f', 'center');
+      txt((L1(k.sk) + ' DEKE, 2X = SPIN').slice(0, 29), r[1], y + 30, 8, '#e4f7ff', 'center');
+    });
+  }
+}
+function drawOverlays() {
+  const m = S.mode;
+  if (m === 'title') { drawTitle(); return; }
+  if (m === 'lobby') { drawLobby(); return; }
+  if (m === 'countdown') {
+    const n = Math.ceil(S.cd / 0.8);
+    if (n >= 1 && n <= 3) {
+      const col = ['#ffd23f', '#ffb100', '#ff5a1f'][n - 1];
+      txt(String(n), 240, 126, 32, col, 'center', '#14182b');
+    }
+    if (S.ot) txt('SUDDEN DEATH', 240, 96, 16, '#ff5a5f', 'center');
+    else if (S.score[0] + S.score[1] === 0 && S.time === MATCH_TIME) {
+      txt('FACE OFF!', 240, 96, 16, '#ffffff', 'center');
+      txt('FIRST TO ' + SCORE_LIMIT + ' WINS', 240, 116, 8, '#ffb100', 'center');
+    }
+    ctx.fillStyle = 'rgba(11,13,26,.72)'; ctx.fillRect(10, 224, 460, 64);
+    drawControls(230);
+  }
+  if (m === 'play' && S.goBanner > 0) txt('GO!', 240, 122, 32, '#ffd23f', 'center');
+  if (m === 'goal') {
+    const col = S.goalBy ? '#5aa9ff' : '#ff5a5f';
+    const flick = Math.floor(S.t * 10) % 2;
+    txt('GOAL!', 240, 108, 32, flick ? '#ffffff' : col, 'center', '#14182b');
+    txt(S.goalBy ? 'BLUE SCORES' : 'RED SCORES', 240, 150, 8, col, 'center');
+  }
+  if (m === 'paused') {
+    ctx.fillStyle = 'rgba(11,13,26,.75)'; ctx.fillRect(0, 32, W, H - 32);
+    txt('PAUSED', 240, 120, 24, '#ffd23f', 'center');
+    txt('PRESS P TO RESUME', 240, 160, 8, '#e4f7ff', 'center');
+    txt('PRESS Q TO QUIT TO MENU', 240, 178, 8, '#7f8bb5', 'center');
+    drawControls(214);
+  }
+  if (m === 'over') drawResults();
+}
+
+function render() {
+  if (S.mode === 'intro') { drawIntro(); return; }
+  ctx.fillStyle = '#0f1224'; ctx.fillRect(0, 0, W, H);
+  ctx.save();
+  if (S.shake > 0.5) ctx.translate(Math.round(rnd(-S.shake, S.shake)), Math.round(rnd(-S.shake, S.shake)));
+  ctx.drawImage(rinkLayer, 0, 0);
+  puddles.forEach(drawPuddle);
+  walls.forEach(drawWall);
+  [G[0], G[1], P[0], P[1]].sort((a, b) => a.y - b.y).forEach(e => e.kind === 'g' ? drawGoalie(e) : drawPlayer(e));
+  if (S.mode !== 'title' && S.mode !== 'lobby') drawPuck();
+  decoys.forEach(drawDecoy);
+  drawParticles();
+  ctx.restore();
+  if (S.mode !== 'title' && S.mode !== 'lobby') drawHUD();
+  drawOverlays();
+  drawToast();
+  if (S.flash > 0) { ctx.fillStyle = 'rgba(255,255,255,' + Math.min(0.6, S.flash * 2.2) + ')'; ctx.fillRect(0, 32, W, H - 32); }
+}
+
+/* ---------- main loop ---------- */
+resetPositions();
+let last = performance.now();
+function frame(now) {
+  let dt = (now - last) / 1000; last = now;
+  if (!(dt > 0)) dt = 0;
+  if (dt > 0.05) dt = 0.05;
+  update(dt);
+  render();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
