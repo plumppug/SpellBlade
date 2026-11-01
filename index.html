@@ -255,9 +255,10 @@ addEventListener('keydown', e => {
   try { initAudio(); } catch (err) {}
   if (e.repeat) { K[c] = true; return; }
   K[c] = true;
+  netInputKick();                       // guest: tell the host about the new key state right now, not at the next tick
   onPress(c);
 });
-addEventListener('keyup', e => { K[keyName(e)] = false; });
+addEventListener('keyup', e => { K[keyName(e)] = false; netInputKick(); });
 /* click / tap the game to focus it and start (helps in embedded previews) */
 cv.addEventListener('pointerdown', e => {
   try { cv.focus(); initAudio(); } catch (err) {}
@@ -268,7 +269,7 @@ cv.addEventListener('pointerdown', e => {
     const rb = S.rebind; S.rebind = null; bindKey(rb.col, rb.row, mcode); return;
   }
   if (S.mode === 'play') {                                  // bound mouse buttons act exactly like bound keys
-    if (isBound(mcode)) { K[mcode] = true; onPress(mcode); }
+    if (isBound(mcode)) { K[mcode] = true; netInputKick(); onPress(mcode); }
     return;
   }
   if (e.button !== 0) return;                               // menus: left click only
@@ -301,7 +302,7 @@ cv.addEventListener('pointermove', e => {
   } else if (S.mode === 'title') cv.style.cursor = (S.my < 26 || S.my > 150) ? 'pointer' : 'default';
   else cv.style.cursor = 'default';
 });
-addEventListener('pointerup', e => { K['Mouse' + e.button] = false; });
+addEventListener('pointerup', e => { K['Mouse' + e.button] = false; netInputKick(); });
 addEventListener('pointercancel', () => { for (let i = 0; i < 5; i++) K['Mouse' + i] = false; });
 cv.addEventListener('contextmenu', e => e.preventDefault());
 cv.addEventListener('wheel', e => { if (S.mode === 'title' && S.tab === 3) { e.preventDefault(); achScroll(e.deltaY > 0 ? 1 : -1); } }, { passive: false });
@@ -552,8 +553,17 @@ const S = { mode: 'title', prev: 'title', t: 0, time: MATCH_TIME, score: [0, 0],
             menuRow: 0, cpu: true, cpuId: 1, level: 1,
             chars: [0, 1], tab: 0, fAct: 0, introT: 0 };
 // online session (peer-to-peer): role is 'host' (runs the match, plays RED) or 'guest' (sends controls, plays BLUE)
-const NET = { role: null, me: 0, peer: null, conn: null, inMatch: false, ev: [], sAcc: 0, inT: 0, lastRx: 0,
-              inp: { ix: 0, iy: 0, sh: false }, peerChar: 0, myPick: 0, saved: null, rem: false };
+const NET = { role: null, me: 0, peer: null, conn: null, inMatch: false, ev: [], lastRx: 0,
+              inp: { ix: 0, iy: 0, sh: false }, peerChar: 0, myPick: 0, saved: null, rem: false,
+              // fixed-rate network clocks (timestamps in ms): host snapshots and guest input packets both go out at NET_HZ
+              nextSend: 0, nextIn: 0, snapN: 0,
+              // input sequencing: the guest numbers every input packet, the host echoes the last one it applied (ack)
+              mid: 0, seq: 0, ack: 0, ackSeen: 0, hist: [], lastSig: '',
+              // client-side prediction state for the guest's own skater
+              pred: null, pOK: true, pacc: 0, first: false };
+const NET_HZ = 60;                        // network tick rate for both directions
+const SNAP_ME = 60, SNAP_OTHER = 40;      // position error (px) above which we teleport instead of easing
+const CORR_RATE = 12;                     // how fast prediction errors are eased out (per second; ~80 ms to fade)
 const isMe = id => !NET.role || id === NET.me;
 let acc = 0;
 const particles = [], texts = [];
@@ -622,7 +632,7 @@ function startGame() {
   stats[0] = mkStats(); stats[1] = mkStats(); puck.shotOn = false; S.resSel = 0; S.def = [0, 0];
   S.cd = 2.4; S.mode = 'intro'; S.introT = 0;
   sfx('vs');
-  if (NET.role === 'host') { S.remReq = false; NET.sAcc = 1; NET.lastRx = performance.now(); netSend({ t: 'start', chars: S.chars.slice() }); }
+  if (NET.role === 'host') { S.remReq = false; NET.nextSend = 0; NET.snapN = 0; NET.ack = 0; NET.mid++; NET.lastRx = performance.now(); netSend({ t: 'start', chars: S.chars.slice(), mid: NET.mid }); }
 }
 function skipIntro() { S.mode = 'countdown'; S.cd = 2.4; sfx('tick'); }
 function togglePause() {
@@ -1716,8 +1726,11 @@ function netData(m) {
       if (S.lob) { S.lob.st = 'ready'; S.lob.msg = ''; }
       sfx('ready'); break;
     case 'bye': netLost('OPPONENT LEFT'); break;
-    case 'in':                                                       // host: the guest's controls
-      NET.inp.ix = clamp(num(m.x), -1, 1); NET.inp.iy = clamp(num(m.y), -1, 1); NET.inp.sh = !!m.s; break;
+    case 'in':                                                       // host: the guest's controls (key states, never positions)
+      if (NET.role !== 'host' || m.mid !== NET.mid) break;           // ignore packets left over from a previous match
+      NET.inp.ix = (m.right ? 1 : 0) - (m.left ? 1 : 0); NET.inp.iy = (m.down ? 1 : 0) - (m.up ? 1 : 0); NET.inp.sh = !!m.shoot;
+      if (num(m.q) > NET.ack) NET.ack = num(m.q);                    // echoed back in every snapshot so the guest knows what we've applied
+      break;
     case 'sp': if (NET.role === 'host' && NET.inMatch && S.mode === 'play') castSpell(P[1]); break;
     case 'sk': if (NET.role === 'host' && NET.inMatch) useSkill(P[1]); break;
     case 'rem': if (NET.role === 'host' && S.mode === 'over') { S.remReq = true; sfx('ready'); } break;
@@ -1738,32 +1751,44 @@ function rematch() {
 }
 function guestStart(m) {
   if (!NET.saved) NET.saved = { chars: S.chars.slice(), cpu: S.cpu };
-  NET.inMatch = true; NET.rem = false; NET.inT = 0;
+  NET.inMatch = true; NET.rem = false; NET.mid = num(m.mid) | 0; NET.seq = 0; NET.hist = []; NET.lastSig = ''; NET.nextIn = 0; NET.first = true; NET.pOK = true; NET.pacc = 0;
   S.chars = [clamp(num(m.chars && m.chars[0]) | 0, 0, CH.length - 1), clamp(num(m.chars && m.chars[1]) | 0, 0, CH.length - 1)];
   S.cpu = false; S.score = [0, 0]; S.time = MATCH_TIME; S.ot = false; S.winner = -1; S.xpRes = null; S.resSel = 0;
-  P.forEach(p => { p.cpu = false; p.net = null; p.char = S.chars[p.id]; });
+  P.forEach(p => { p.cpu = false; p.net = null; p.char = S.chars[p.id]; p.spd = CH[p.char].spd; });
   particles.length = 0; texts.length = 0; resetPositions();
+  P.forEach(p => { p.rx = p.x; p.ry = p.y; p.rbx = p.bx; p.rby = p.by; p.ex = p.ey = 0; });
+  puck.rx = puck.x; puck.ry = puck.y; puck.ex = puck.ey = 0; NET.pred = predState(P[NET.me]);
   stats[0] = mkStats(); stats[1] = mkStats();
   S.mode = 'intro'; S.introT = 0; S.cd = 2.4; S.lob = null;
 }
 // ---- host: build + send the state snapshot -------------------------------------------------------------
+// Fixed-rate timer on timestamps: fires once per 1000/hz ms no matter whether the screen runs at 60, 144 or 240 Hz.
+function due(slot, now, hz) {
+  const iv = 1000 / hz;
+  if (now < NET[slot]) return false;
+  NET[slot] = (now - NET[slot] > 5 * iv) ? now + iv : NET[slot] + iv;          // after a long stall, resync instead of bursting
+  return true;
+}
 function hostTick(dt) {
-  if (performance.now() - NET.lastRx > 7000) { netLost('CONNECTION LOST'); return; }
-  NET.sAcc += dt;
-  if (NET.sAcc < 1 / 30) return;
-  NET.sAcc = 0;
-  netSend({
+  const now = performance.now();
+  if (now - NET.lastRx > 7000) { netLost('CONNECTION LOST'); return; }
+  if (!due('nextSend', now, NET_HZ)) return;                         // host physics runs every frame in fixed 1/120 s steps; we only *broadcast* at 60 Hz
+  NET.snapN++;
+  const slow = S.mode === 'over' || S.mode === 'goal' || NET.snapN % 20 === 0;      // match stats change rarely: send them occasionally
+  const snap = {
     t: 's', mo: S.mode, tm: rd(S.time, 100), ot: S.ot ? 1 : 0, cd: rd(S.cd, 100), gt: rd(S.goalT, 100), gb: S.goalBy, gbn: rd(S.goBanner, 100),
     it: rd(S.introT, 100), sc: S.score.slice(), w: S.winner, er: S.endReason || '', sk: rd(S.shake, 10), fl: rd(S.flash, 100),
+    ak: NET.ack,                                                     // last guest input packet applied -> lets the guest replay only the newer ones
     p: P.map(p => PF.map(k => rd(p[k], k === 'x' || k === 'y' || k === 'bx' || k === 'by' ? 10 : 100))),
     g: G.map(g => [rd(g.y, 10), rd(g.stun, 100), rd(g.vy, 10)]),
     pk: [rd(puck.x, 10), rd(puck.y, 10), rd(puck.vx, 10), rd(puck.vy, 10), puck.fire ? 1 : 0, puck.carrier],
     wl: walls.map(w => [rd(w.x, 10), rd(w.y, 10), w.w, w.h, rd(w.t, 100), rd(w.age, 100)]),
     dc: decoys.map(d => [rd(d.x, 10), rd(d.y, 10), rd(d.vx, 10), rd(d.vy, 10), rd(d.t, 100), rd(d.age, 100), d.owner]),
     pd: puddles.map(q => [rd(q.x, 10), rd(q.y, 10), rd(q.sx, 10), rd(q.sy, 10), q.r, rd(q.t, 100), rd(q.age, 100), q.landed ? 1 : 0, q.owner]),
-    st: stats.map(o => STAT_KEYS.map(k => o[k])),
     ev: NET.ev.splice(0)
-  });
+  };
+  if (slow) snap.st = stats.map(o => STAT_KEYS.map(k => o[k]));
+  netSend(snap);
 }
 // ---- guest: apply a snapshot, then keep things moving between snapshots ------------------------------
 function netApply(m) {
@@ -1771,14 +1796,48 @@ function netApply(m) {
   S.mode = m.mo; S.time = num(m.tm); S.ot = !!m.ot; S.cd = num(m.cd); S.goalT = num(m.gt); S.goalBy = m.gb ? 1 : 0; S.goBanner = num(m.gbn);
   S.introT = num(m.it); S.score = [num(m.sc && m.sc[0]), num(m.sc && m.sc[1])]; S.winner = num(m.w, -1); S.endReason = String(m.er || '');
   S.shake = Math.max(S.shake, num(m.sk)); S.flash = Math.max(S.flash, num(m.fl));
-  (m.p || []).forEach((a, i) => { const p = P[i]; if (p) PF.forEach((k, j) => { p[k] = num(a[j]); }); });
-  P.forEach(p => { p.char = clamp(p.char | 0, 0, CH.length - 1); });
+  // ---- reconciliation: the host's snapshot is the truth; we blend toward it instead of snapping --------------------
+  NET.ackSeen = num(m.ak);
+  const first = NET.first; NET.first = false;
+  (m.p || []).forEach((a, i) => {
+    const p = P[i]; if (!p) return;
+    const sn = {}; PF.forEach((k, j) => { sn[k] = num(a[j]); });
+    sn.char = clamp(sn.char | 0, 0, CH.length - 1);
+    const mine = i === NET.me;
+    for (const k of PF) {                                            // everything that isn't a position is simply taken from the host
+      if (k === 'x' || k === 'y' || k === 'bx' || k === 'by') continue;
+      if (mine && (k === 'vx' || k === 'vy' || k === 'ang' || k === 'face' || k === 'anim')) continue;      // those come from my prediction
+      p[k] = sn[k];
+    }
+    const dx = p.x, dy = p.y;                                        // where the skater is drawn right now (incl. any easing offset)
+    let base = sn;                                                   // the position we should be heading for
+    if (mine) {
+      sn.spd = p.spd || 1; sn.bvx = sn.bvy = 0;
+      // free movement only: stuns, oil, dekes and spins are decided by the host, so we don't predict those
+      NET.pOK = sn.stun <= 0 && sn.dekeT <= 0 && sn.spinT <= 0 && sn.oil <= 0;
+      // rewind to the host's state, then re-apply the inputs it hasn't seen yet -> where the host will have me by "now"
+      base = (NET.pOK && S.mode === 'play') ? reconcile(sn) : sn;
+      NET.pred = base;
+      p.vx = base.vx; p.vy = base.vy; p.ang = base.ang; p.face = base.face; p.anim = base.anim;
+    }
+    // prediction error: if small, remember it as an offset that decays (smooth lerp); if huge (goal reset, big hit) just teleport
+    const err = Math.hypot(dx - base.x, dy - base.y), lim = mine ? SNAP_ME : SNAP_OTHER;
+    p.ex = (!first && err < lim) ? dx - base.x : 0; p.ey = (!first && err < lim) ? dy - base.y : 0;
+    p.rx = base.x; p.ry = base.y; p.rbx = base.bx; p.rby = base.by;
+    p.x = p.rx + p.ex; p.y = p.ry + p.ey; p.bx = p.rbx + p.ex; p.by = p.rby + p.ey;
+  });
   (m.g || []).forEach((a, i) => { if (G[i]) { G[i].y = num(a[0], CY); G[i].stun = num(a[1]); G[i].vy = num(a[2]); } });
-  if (m.pk) { puck.x = num(m.pk[0], 240); puck.y = num(m.pk[1], CY); puck.vx = num(m.pk[2]); puck.vy = num(m.pk[3]); puck.fire = !!m.pk[4]; puck.carrier = num(m.pk[5], -1); }
+  if (m.pk) {
+    const ox = puck.x, oy = puck.y, nx = num(m.pk[0], 240), ny = num(m.pk[1], CY);
+    puck.vx = num(m.pk[2]); puck.vy = num(m.pk[3]); puck.fire = !!m.pk[4]; puck.carrier = num(m.pk[5], -1);
+    const near = !first && Math.hypot(ox - nx, oy - ny) < SNAP_OTHER;       // same easing trick for the puck
+    puck.ex = near ? ox - nx : 0; puck.ey = near ? oy - ny : 0; puck.rx = nx; puck.ry = ny;
+    puck.x = nx + puck.ex; puck.y = ny + puck.ey;
+  }
   walls = (m.wl || []).map(a => ({ x: a[0], y: a[1], w: a[2], h: a[3], t: a[4], age: a[5], dead: false }));
   decoys = (m.dc || []).map(a => ({ x: a[0], y: a[1], vx: a[2], vy: a[3], t: a[4], age: a[5], owner: a[6] }));
   puddles = (m.pd || []).map(a => ({ x: a[0], y: a[1], sx: a[2], sy: a[3], r: a[4], t: a[5], age: a[6], landed: !!a[7], owner: a[8] }));
-  (m.st || []).forEach((a, i) => { if (stats[i]) STAT_KEYS.forEach((k, j) => { stats[i][k] = num(a[j]); }); });
+  if (m.st) m.st.forEach((a, i) => { if (stats[i]) STAT_KEYS.forEach((k, j) => { stats[i][k] = num(a[j]); }); });
   (m.ev || []).forEach(e => {                                         // sounds, bursts and floating text from the host
     try {
       if (e[0] === 's') sfx(e[1]);
@@ -1790,32 +1849,104 @@ function netApply(m) {
   if (m.mo === 'intro' && prev !== 'intro') { particles.length = 0; texts.length = 0; }
   if (m.mo === 'over' && prev !== 'over') { S.overAt = S.t; S.resSel = 0; NET.rem = false; awardXp(); }
 }
+// Movement of a free-skating player for one fixed step: the same maths as stepPlayer(), minus anything the host decides
+// (stuns, oil, dekes, spins, shooting) and minus other bodies. The guest runs this on its own skater every frame.
+function predictMove(p, ix, iy, h) {
+  const len = Math.hypot(ix, iy), spd = (p.spd || 1) * (1 - 0.22 * (p.charge || 0));
+  let tx = 0, ty = 0, rate = 1.5;
+  if (len > 0) { ix /= len; iy /= len; tx = ix * MAXV * spd; ty = iy * MAXV * spd; rate = 7; }
+  const k = Math.min(1, rate * h);
+  p.vx += (tx - p.vx) * k; p.vy += (ty - p.vy) * k;
+  if (len > 0) {
+    let d = Math.atan2(iy, ix) - p.ang; d = Math.atan2(Math.sin(d), Math.cos(d));
+    const mx = TURN * h; p.ang += clamp(d, -mx, mx);
+  }
+  p.x += p.vx * h; p.y += p.vy * h;
+  p.anim += Math.hypot(p.vx, p.vy) * h * 0.09;
+  const c = Math.cos(p.ang);
+  if (c > 0.25) p.face = 1; else if (c < -0.25) p.face = -1;
+  keepInRink(p, PR, 0.2);
+  updateBlade(p, h);
+}
+function predState(p) {
+  return { x: p.x, y: p.y, vx: p.vx, vy: p.vy, ang: p.ang, face: p.face, bx: p.bx, by: p.by, bvx: 0, bvy: 0, anim: p.anim, charge: p.charge || 0, spd: p.spd || 1 };
+}
+// Server reconciliation: start from the host's authoritative state, throw away the inputs it has already applied (seq <= ack),
+// then replay the remaining ones (the last round-trip's worth) with the same fixed step. The result is where the host
+// *will* have us, so a correct prediction produces zero visible correction.
+function reconcile(sn) {
+  const pr = { x: sn.x, y: sn.y, vx: sn.vx, vy: sn.vy, ang: sn.ang, face: sn.face, bx: sn.bx, by: sn.by, bvx: 0, bvy: 0, anim: sn.anim, charge: sn.charge, spd: sn.spd };
+  while (NET.hist.length && NET.hist[0].q <= NET.ackSeen) NET.hist.shift();
+  const now = performance.now(); let acc = 0;
+  for (let i = 0; i < NET.hist.length; i++) {
+    const e = NET.hist[i], end = i + 1 < NET.hist.length ? NET.hist[i + 1].at : now;
+    acc += Math.max(0, end - e.at) / 1000;
+    while (acc >= STEP) { predictMove(pr, e.ix, e.iy, STEP); acc -= STEP; }
+  }
+  NET.pacc = acc;                                                    // leftover time carries into the live stepping
+  return pr;
+}
+function guestInput() {
+  let ix = 0, iy = 0, sh = false;
+  for (const k of [BIND[0], BIND[1]]) {
+    ix += (K[k.r] ? 1 : 0) - (K[k.l] ? 1 : 0); iy += (K[k.d] ? 1 : 0) - (K[k.u] ? 1 : 0);
+    if (K[k.s]) sh = true;
+  }
+  return { ix: clamp(ix, -1, 1), iy: clamp(iy, -1, 1), sh };
+}
+// Send my key states ({up, down, left, right, shoot}) with a sequence number, and remember them for reconciliation.
+function guestSendInput(now) {
+  const i = guestInput();
+  NET.seq++; NET.lastSig = i.ix + ',' + i.iy + ',' + i.sh;
+  NET.hist.push({ q: NET.seq, at: now, ix: i.ix, iy: i.iy });
+  if (NET.hist.length > 300) NET.hist.shift();
+  netSend({ t: 'in', q: NET.seq, mid: NET.mid, up: i.iy < 0, down: i.iy > 0, left: i.ix < 0, right: i.ix > 0, shoot: i.sh });
+}
+function netInputKick() {                                            // called straight from keydown/keyup: no waiting for the next tick
+  if (NET.role !== 'guest' || !NET.inMatch) return;
+  const i = guestInput();
+  if (i.ix + ',' + i.iy + ',' + i.sh !== NET.lastSig) guestSendInput(performance.now());
+}
 function guestTick(dt) {
-  if (performance.now() - NET.lastRx > 7000) { netLost('CONNECTION LOST'); return; }
+  const now = performance.now();
+  if (now - NET.lastRx > 7000) { netLost('CONNECTION LOST'); return; }
   const m = S.mode;
   if (m === 'intro') S.introT += dt; else if (m === 'countdown') S.cd -= dt; else if (m === 'goal') S.goalT -= dt;
-  if (m === 'play' || m === 'goal' || m === 'countdown') {
-    for (const p of P) {                                              // dead-reckon until the next snapshot arrives
-      p.x += p.vx * dt; p.y += p.vy * dt; p.bx += p.vx * dt; p.by += p.vy * dt; p.anim += Math.hypot(p.vx, p.vy) * dt * 0.09;
+  const live = m === 'play' || m === 'goal' || m === 'countdown';
+  const me = P[NET.me], pr = NET.pred;
+  // ---- CLIENT-SIDE PREDICTION: my own skater reacts to my keys this very frame, in the same fixed 1/120 s steps the host uses ----
+  if (pr) {
+    const inp = m === 'play' ? guestInput() : { ix: 0, iy: 0 };
+    pr.charge = me.charge;
+    NET.pacc = Math.min(NET.pacc + dt, 0.1);
+    while (NET.pacc >= STEP) {
+      NET.pacc -= STEP;
+      if (NET.pOK && live) predictMove(pr, inp.ix, inp.iy, STEP);
+      else { pr.x += pr.vx * STEP; pr.y += pr.vy * STEP; pr.bx += pr.vx * STEP; pr.by += pr.vy * STEP; }   // host-controlled (stun/deke/...): just coast
     }
-    if (m === 'play' && puck.carrier < 0) { puck.x += puck.vx * dt; puck.y += puck.vy * dt; }
-    G.forEach(g => { g.y = clamp(g.y + g.vy * dt, T + 12, B - 12); });
+    me.rx = pr.x; me.ry = pr.y; me.rbx = pr.bx; me.rby = pr.by;
+    me.vx = pr.vx; me.vy = pr.vy; me.ang = pr.ang; me.face = pr.face; me.anim = pr.anim;
   }
+  // ---- everything else: dead-reckon from the last snapshot (velocity * dt) until the next one arrives ----
+  if (live) {
+    for (const p of P) {
+      if (p === me && pr) continue;
+      p.rx += p.vx * dt; p.ry += p.vy * dt; p.rbx += p.vx * dt; p.rby += p.vy * dt; p.anim += Math.hypot(p.vx, p.vy) * dt * 0.09;
+    }
+    if (m === 'play' && puck.carrier < 0) { puck.rx += puck.vx * dt; puck.ry += puck.vy * dt; }
+    G.forEach(g => { g.y = clamp(g.y + g.vy * dt, CY - MOUTH + GR, CY + MOUTH - GR); });
+  }
+  // ---- SMOOTHING: whatever error the last snapshot revealed fades out exponentially (frame-rate independent) ----
+  const f = Math.exp(-CORR_RATE * dt);
+  for (const o of [P[0], P[1], puck]) { o.ex *= f; o.ey *= f; }
+  for (const p of P) { p.x = p.rx + p.ex; p.y = p.ry + p.ey; p.bx = p.rbx + p.ex; p.by = p.rby + p.ey; }
+  puck.x = puck.rx + puck.ex; puck.y = puck.ry + puck.ey;
   walls.forEach(w => { w.t -= dt; w.age += dt; });
   decoys.forEach(d => { d.x += d.vx * dt; d.y += d.vy * dt; d.t -= dt; d.age += dt; });
   puddles.forEach(q => { q.age += dt; if (q.landed) q.t -= dt; });
-  if (puck.fire && m === 'play') for (let i = 0; i < 3; i++) spawn(puck.x + rnd(-2, 2), puck.y + rnd(-2, 2), -puck.vx * 0.04 + rnd(-14, 14), rnd(-24, -4), rnd(0.25, 0.5), rnd(3, 6), FIRE_COLS);
+  if (puck.fire && m === 'play') trail(dt);
   ambient(dt);
-  NET.inT += dt;                                                      // my controls -> host
-  if (NET.inT >= 1 / 30) {
-    NET.inT = 0;
-    let ix = 0, iy = 0, sh = false;
-    for (const k of [BIND[0], BIND[1]]) {
-      ix += (K[k.r] ? 1 : 0) - (K[k.l] ? 1 : 0); iy += (K[k.d] ? 1 : 0) - (K[k.u] ? 1 : 0);
-      if (K[k.s]) sh = true;
-    }
-    netSend({ t: 'in', x: clamp(ix, -1, 1), y: clamp(iy, -1, 1), s: sh ? 1 : 0 });
-  }
+  if (due('nextIn', now, NET_HZ)) guestSendInput(now);              // heartbeat: current key states at a fixed 60 Hz
 }
 function guestPress(c) {
   const m = S.mode;
@@ -1938,13 +2069,18 @@ function ambient(dt) {
     if (p.shield > 0 && Math.random() < dt * 20) spawn(p.x + rnd(-9, 9), p.y + rnd(-11, 7), 0, rnd(-14, -4), 0.4, 2, GOLD_COLS);
     if (p.oil > 0 && Math.random() < dt * 24) spawn(p.x + rnd(-6, 6), p.y + rnd(0, 7), rnd(-10, 10), rnd(-6, 6), 0.35, 2, OIL_COLS);
     if (p.dekeT > 0 && Math.random() < dt * 60) spawn(p.x + rnd(-4, 4), p.y + rnd(-6, 6), -p.dkx * 20, -p.dky * 20, 0.25, 2, ['#ffffff', '#c9e8f3', '#8fd3ff']);
-    if (p.spinT > 0) spawn(p.bx + rnd(-1, 1), p.by + rnd(-1, 1), rnd(-8, 8), rnd(-8, 8), 0.3, 2, GOLD_COLS);
+    if (p.spinT > 0 && Math.random() < dt * 60) spawn(p.bx + rnd(-1, 1), p.by + rnd(-1, 1), rnd(-8, 8), rnd(-8, 8), 0.3, 2, GOLD_COLS);
     if (p.charge >= 0.999 && Math.random() < dt * 20) spawn(p.bx + rnd(-3, 3), p.by + rnd(-3, 3), rnd(-12, 12), rnd(-18, -4), 0.3, 2, GOLD_COLS);
     if (p.stun > 0 && Math.random() < dt * 25) spawn(p.x + rnd(-6, 6), p.y - 10, rnd(-10, 10), rnd(-30, -10), 0.4, 2, ['#ffd23f', '#ffffff']);
   });
   G.forEach(g => {
     if (g.stun > 0 && Math.random() < dt * 25) spawn(g.x + rnd(-6, 6), g.y - 10, rnd(-10, 10), rnd(-30, -10), 0.4, 2, ['#ffd23f', '#ffffff']);
   });
+}
+// fireball trail: ~180 embers a second regardless of frame rate (stochastic rounding keeps 144 Hz and 60 Hz identical on average)
+function trail(dt) {
+  let n = 180 * dt; n = Math.floor(n) + (Math.random() < n - Math.floor(n) ? 1 : 0);
+  for (let i = 0; i < n; i++) spawn(puck.x + rnd(-2, 2), puck.y + rnd(-2, 2), -puck.vx * 0.04 + rnd(-14, 14), rnd(-24, -4), rnd(0.25, 0.5), rnd(3, 6), FIRE_COLS);
 }
 function liveUpdate(dt) {
   for (const w of walls) {
@@ -1953,11 +2089,7 @@ function liveUpdate(dt) {
     if (!w.dead && w.t <= 0) { w.dead = true; shatterWall(w, false); }
   }
   walls = walls.filter(w => !w.dead);
-  if (puck.fire) {
-    for (let i = 0; i < 3; i++) {
-      spawn(puck.x + rnd(-2, 2), puck.y + rnd(-2, 2), -puck.vx * 0.04 + rnd(-14, 14), rnd(-24, -4), rnd(0.25, 0.5), rnd(3, 6), FIRE_COLS);
-    }
-  }
+  if (puck.fire) trail(dt);
   // Shadow Clone decoys: slide around, fool the goalie, then vanish in smoke
   for (let i = decoys.length - 1; i >= 0; i--) {
     const d = decoys[i];
