@@ -309,7 +309,7 @@ cv.addEventListener('wheel', e => { if (S.mode === 'title' && S.tab === 3) { e.p
 ['mousedown', 'mouseup', 'auxclick'].forEach(n => cv.addEventListener(n, e => { if (e.button > 0) e.preventDefault(); }));   // no autoscroll / back / forward
 addEventListener('blur', () => { for (const k in K) K[k] = false; if (S.mode === 'play') togglePause(); });
 addEventListener('paste', e => {
-  if (S.mode !== 'lobby' || !S.lob || S.lob.st !== 'joining') return;
+  if (S.mode !== 'lobby' || !S.lob || (S.lob.st !== 'joining' && S.lob.st !== 'fcode')) return;
   const t = ((e.clipboardData && e.clipboardData.getData('text')) || '').toUpperCase().replace(/[^A-Z0-9]/g, '').replace(/^SPELLBLADEHOCKEY/, '');
   S.lob.code = (S.lob.code + t).split('').filter(ch => NET_ALPHA.includes(ch)).join('').slice(0, 5);
 });
@@ -553,8 +553,13 @@ const S = { mode: 'title', prev: 'title', t: 0, time: MATCH_TIME, score: [0, 0],
             menuRow: 0, cpu: true, cpuId: 1, level: 1,
             chars: [0, 1], tab: 0, fAct: 0, introT: 0 };
 // online session (peer-to-peer): role is 'host' (runs the match, plays RED) or 'guest' (sends controls, plays BLUE)
+// MULTI-PEER LAYOUT
+//   host : NET.peers = [{ conn, slot, char, name, inp:{ix,iy,sh,ack}, lastRx }, ...]  (up to 5 remote clients, one per slot 1..5)
+//          NET.roster[slot] = { char, cpu }  decided when the match starts (empty slots become bots)
+//   guest: NET.conn = the single data connection to the host, NET.me = my slot (assigned by the host)
 const NET = { role: null, me: 0, peer: null, conn: null, inMatch: false, ev: [], lastRx: 0,
-              inp: { ix: 0, iy: 0, sh: false }, peerChar: 0, myPick: 0, saved: null, rem: false,
+              peers: [], roster: [], mode: 2, code: '', lobby: null, joinCode: '',
+              inp: { ix: 0, iy: 0, sh: false }, myPick: 0, saved: null, rem: false,
               // fixed-rate network clocks (timestamps in ms): host snapshots and guest input packets both go out at NET_HZ
               nextSend: 0, nextIn: 0, snapN: 0,
               // input sequencing: the guest numbers every input packet, the host echoes the last one it applied (ack)
@@ -576,7 +581,7 @@ function stat(id, k) { if (S.mode === 'play') stats[id][k]++; }
 // A "shot" is a real strike (stick or Fireball) heading at the other net; "on goal" if it would cross the goal mouth.
 function registerShot(p, any) {
   if (S.mode !== 'play' || S.t - (p.shotAt || -9) < 0.6) return;
-  const dir = p.id === 0 ? 1 : -1, goalX = p.id === 0 ? R : L;
+  const dir = p.team === 0 ? 1 : -1, goalX = p.team === 0 ? R : L;
   const sp = Math.hypot(puck.vx, puck.vy);
   if (sp < 150 || puck.vx * dir <= 0 || Math.abs(puck.vx) < sp * 0.35) return;
   if (!any && Math.abs(goalX - puck.x) > 250) return;
@@ -584,20 +589,35 @@ function registerShot(p, any) {
   if (Math.abs(yAt - CY) > 95) return;
   p.shotAt = S.t;
   const on = Math.abs(yAt - CY) < MOUTH + 3;
-  stats[p.id].shots++;                       // 'on goal' is counted when the shot ends as a goal or a save
-  puck.shotTeam = p.id; puck.shotOn = on; puck.shotT = S.t;
+  stats[p.team].shots++;                     // 'on goal' is counted when the shot ends as a goal or a save
+  puck.shotTeam = p.team; puck.shotOn = on; puck.shotT = S.t;
 }
 
+// Players are identified by a unique SLOT (p.id, also their index in P) and belong to a TEAM (p.team: 0 = Red, 1 = Blue).
+// Slots alternate teams, so 1v1 is slots 0/1, 2v2 adds 2/3, 3v3 adds 4/5. Everything that is about "which side" (score, goals,
+// stats, sprite colours) uses p.team; everything that is about "which skater" (puck carrier/owner, network inputs) uses p.id.
+const SLOT_COL = ['#ff5a5f', '#4da3ff', '#ffa94d', '#7ed0ff', '#ffe066', '#b197fc'];      // each skater gets their own marker colour
+const slotLabel = id => (id % 2 ? 'B' : 'R') + (Math.floor(id / 2) + 1);                    // R1 R2 R3 / B1 B2 B3
+const FORM = [[100, 0], [150, -58], [150, 58]];                                              // per-team face-off spots: [distance from own end, y offset]
 function mkPlayer(id) {
-  return { kind: 'p', id, x: 0, y: 0, vx: 0, vy: 0, ang: id ? Math.PI : 0, face: id ? -1 : 1,
+  return { kind: 'p', id, team: id % 2, x: 0, y: 0, vx: 0, vy: 0, ang: id ? Math.PI : 0, face: id ? -1 : 1,
            char: id ? 1 : 0, shield: 0, oil: 0, chkCd: 0, slipDir: 1,
            mana: 0.3, stun: 0, bx: 0, by: 0, bvx: 0, bvy: 0, anim: 0, noPuck: 0, wasFull: false,
            charge: 0, wasHeld: false, snapCd: 0, holdT: 0, dekeT: 0, dodge: 0, dodgeTxt: 0, dekeCd: 0,
            spinT: 0, spinCd: 0, spin0: 0, spinDir: 1, lastTap: -9, side: 1, dkx: 0, dky: 0, inx: 0, iny: 0,
            aiShoot: false, aiShooting: false, aiChgT: 0, carryT: 0,
-           k: BIND[id] };
+           k: BIND[id] || BIND[0] };
 }
 const P = [mkPlayer(0), mkPlayer(1)];
+function buildRoster(n) { P.length = 0; for (let i = 0; i < n; i++) P.push(mkPlayer(i)); }   // 2, 4 or 6 skaters
+const teamOf = t => P.filter(p => p.team === t);
+const humanTeam = t => NET.role ? (P[NET.me] && P[NET.me].team === t) : P.some(p => p.team === t && !p.cpu);   // does a local human play for this team?
+function nearOpp(p, x = p.x, y = p.y) {                       // closest skater on the other team (to a point; default: to p)
+  let best = null, bd = 1e9;
+  for (const q of P) if (q.team !== p.team) { const d = Math.hypot(q.x - x, q.y - y); if (d < bd) { bd = d; best = q; } }
+  return best || p;
+}
+const leadOf = t => { const m = NET.role && P[NET.me] && P[NET.me].team === t ? P[NET.me] : null; return m || teamOf(t)[0] || P[t]; };   // whose card / HUD bar represents a team
 const G = [
   { kind: 'g', team: 0, x: L + 11, y: CY, vy: 0, stun: 0 },
   { kind: 'g', team: 1, x: R - 11, y: CY, vy: 0, stun: 0 }
@@ -606,8 +626,9 @@ const puck = { x: 240, y: CY, vx: 0, vy: 0, r: 3.2, fire: false, owner: -1, ignT
 
 function resetPositions() {
   P.forEach((p, i) => {
-    p.x = i ? R - 100 : L + 100; p.y = CY; p.vx = p.vy = 0;
-    p.ang = i ? Math.PI : 0; p.face = i ? -1 : 1; p.stun = 0; p.shield = 0; p.oil = 0; p.chkCd = 0;
+    const f = FORM[Math.floor(i / 2)];                                   // team formation: skater k of a team starts at FORM[k]
+    p.x = p.team ? R - f[0] : L + f[0]; p.y = CY + f[1]; p.vx = p.vy = 0;
+    p.ang = p.team ? Math.PI : 0; p.face = p.team ? -1 : 1; p.stun = 0; p.shield = 0; p.oil = 0; p.chkCd = 0;
     p.charge = 0; p.wasHeld = false; p.snapCd = 0; p.holdT = 0; p.dekeT = 0; p.dodge = 0; p.dekeCd = 0; p.spinT = 0; p.spinCd = 0;
     p.aiShoot = false; p.aiShooting = false; p.carryT = 0; p.lastTap = -9;
     p.bx = p.x + Math.cos(p.ang) * BL; p.by = p.y + 3 + Math.sin(p.ang) * BL * 0.8; p.bvx = p.bvy = 0;
@@ -617,12 +638,14 @@ function resetPositions() {
   walls.length = 0; decoys.length = 0; puddles.length = 0;
 }
 function startGame() {
+  if (!NET.role && P.length !== 2) buildRoster(2);
   sanitizeChars();
   S.score = [0, 0]; S.time = MATCH_TIME; S.ot = false; S.otT = 0; S.winner = -1;
   P.forEach(p => {
     p.mana = 0.3; p.noPuck = 0; p.wasFull = false;
-    p.cpu = S.cpu && p.id === S.cpuId;
-    p.char = S.chars[p.id];
+    const ro = NET.role === 'host' && NET.roster[p.id];                  // online: the lobby decided who is human and who is a bot
+    p.cpu = ro ? ro.cpu : (S.cpu && p.id === S.cpuId);
+    p.char = ro ? ro.char : S.chars[p.id];
     p.spd = (p.cpu ? DIFF[S.level].spd : 1) * CH[p.char].spd;
     p.aiIx = 0; p.aiIy = 0; p.aiT = 0; p.aiCd = 0; p.aiFireT = 0; p.stuckT = 0;
     p.aiAimY = CY; p.aiTx = p.x; p.aiTy = p.y;
@@ -632,7 +655,12 @@ function startGame() {
   stats[0] = mkStats(); stats[1] = mkStats(); puck.shotOn = false; S.resSel = 0; S.def = [0, 0];
   S.cd = 2.4; S.mode = 'intro'; S.introT = 0;
   sfx('vs');
-  if (NET.role === 'host') { S.remReq = false; NET.nextSend = 0; NET.snapN = 0; NET.ack = 0; NET.mid++; NET.lastRx = performance.now(); netSend({ t: 'start', chars: S.chars.slice(), mid: NET.mid }); }
+  if (NET.role === 'host') {
+    S.remReq = false; NET.nextSend = 0; NET.snapN = 0; NET.mid++;
+    NET.peers.forEach(r => { r.inp.ack = 0; r.lastRx = performance.now(); });
+    // each client gets the full roster plus *its own* slot number ("you")
+    for (const r of NET.peers) if (r.slot >= 0) netTo(r, { t: 'start', mid: NET.mid, n: P.length, you: r.slot, slots: NET.roster.map(q => ({ char: q.char, cpu: q.cpu })) });
+  }
 }
 function skipIntro() { S.mode = 'countdown'; S.cd = 2.4; sfx('tick'); }
 function togglePause() {
@@ -735,11 +763,10 @@ function changeRow(d) {
   sfx('tick');
 }
 function onPress(c) {
-  if (S.mode === 'lobby' && S.lob && S.lob.st === 'joining') { lobbyPress(c); return; }      // typing a room code: every letter counts
+  if (S.mode === 'lobby') { lobbyPress(c); return; }                    // the lobby sees every key first: letters are typed, not hotkeys
   if (S.mode === 'title' && S.tab === 2) { controlsPress(c); return; }
   if (c === 'KeyM') { muted = !muted; return; }
   if (c === 'KeyF') { toggleFullscreen(); return; }
-  if (S.mode === 'lobby') { lobbyPress(c); return; }
   if (NET.role === 'guest' && NET.inMatch) { guestPress(c); return; }
   if (S.mode === 'intro') {
     if (c === 'Escape') toMenu();
@@ -845,7 +872,7 @@ function sanitizeChars() { if (NET.role) return; for (let id = 0; id < 2; id++) 
 function calcXp() {
   const mult = S.cpu ? [0.75, 1, 1.25][S.level] : 1;
   const it = { goals: 0, saves: 0, moves: 0, result: 0 };
-  (NET.role ? [NET.me] : [0, 1].filter(i => !P[i].cpu)).forEach(i => {
+  (NET.role ? [P[NET.me] ? P[NET.me].team : 0] : [0, 1].filter(i => !P[i].cpu)).forEach(i => {
     const st = stats[i];
     it.goals += st.goals * 15;
     it.saves += st.saves * 8;
@@ -877,16 +904,16 @@ try {
 function saveAch() { try { localStorage.setItem(ACH_KEY, JSON.stringify(ACH_SAVED)); } catch (e) {} }
 function achCount() { return ACH.filter(a => ACH_SAVED[a.id]).length; }
 // only human players earn badges; the CPU never does
-function unlock(id, pid) {
+function unlock(id, pid) {                                      // pid = the TEAM that earned it; counts if a local human plays for that team
   id = ACH_ID[id] || id;
-  if (ACH_SAVED[id] || !P[pid] || P[pid].cpu || !isMe(pid)) return;
+  if (ACH_SAVED[id] || !humanTeam(pid)) return;
   const a = ACH.find(x => x.id === id); if (!a) return;
   ACH_SAVED[id] = Date.now(); saveAch();
   ACH_Q.push({ id, name: a.name, pid });
 }
 function checkAchievements() {
   for (let id = 0; id < 2; id++) {
-    if (P[id].cpu) continue;
+    if (!humanTeam(id)) continue;
     const st = stats[id];
     if (st.goals >= 1) unlock('first', id);
     if (st.goals >= 3) unlock('hat', id);
@@ -929,7 +956,7 @@ function drawToast() {
   ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x + 7, y + 7, 24, 24);
   drawIcon(ACH_CUR.id, x + 7, y + 7, 2, false);
   txt(ACH_CUR.title || 'ACHIEVEMENT UNLOCKED!', x + 38, y + 9, 8, '#ffd23f');
-  txt((S.cpu || ACH_CUR.pid < 0 ? '' : 'P' + (ACH_CUR.pid + 1) + ' ') + ACH_CUR.name, x + 38, y + 22, 8, '#ffffff');
+  txt((S.cpu || NET.role || ACH_CUR.pid < 0 ? '' : 'P' + (ACH_CUR.pid + 1) + ' ') + ACH_CUR.name, x + 38, y + 22, 8, '#ffffff');
   // twinkling pixel sparkles
   ctx.fillStyle = '#ffffff';
   for (let i = 0; i < 4; i++) {
@@ -1134,7 +1161,7 @@ function releaseShot(p) {
   puck.carrier = -1; puck.snapT = 0;
   puck.vx = c * v + p.vx * 0.25; puck.vy = s * v + p.vy * 0.25;
   puck.owner = p.id; puck.ignT = 0.12; p.snapCd = 0.3; p.holdT = 0;
-  puck.snipe = (ch >= 0.95 && (p.id === 0 ? p.x < 240 : p.x > 240)) ? p.id : -1; puck.snipeT = S.t;   // full charge from your own half
+  puck.snipe = (ch >= 0.95 && (p.team === 0 ? p.x < 240 : p.x > 240)) ? p.team : -1; puck.snipeT = S.t;   // full charge from your own half
   registerShot(p, ch > 0.3);
   const big = ch >= 0.95;
   burst(puck.x, puck.y, big ? 14 : 3 + Math.round(ch * 7), big ? GOLD_COLS : ['#ffffff', '#c9e8f3'], 40 + ch * 90, 0.3, big ? 3 : 2);
@@ -1152,7 +1179,7 @@ function doDeke(p, side) {
   p.dkx = -sa * sg; p.dky = ca * sg;
   p.dekeT = DEKE_T; p.dodge = DEKE_T + 0.14; p.dekeCd = 0.65; p.lastTap = S.t;
   p.vx += p.dkx * DEKE_V * 0.4; p.vy += p.dky * DEKE_V * 0.4;
-  stat(p.id, 'skills');
+  stat(p.team, 'skills');
   addText('DEKE!', p.x, p.y - 18, '#ffffff');
   burst(p.x, p.y + 3, 6, ['#ffffff', '#c9e8f3', '#8fd3ff'], 60, 0.3, 2);
   sfx('deke');
@@ -1161,7 +1188,7 @@ function doSpin(p) {
   p.dekeT = 0; p.dodge = Math.min(p.dodge, 0.12); p.lastTap = -9;
   p.spinDir = -p.spinDir; p.spin0 = p.ang; p.spinT = SPIN_T;
   p.spinCd = 1.1; p.dekeCd = Math.max(p.dekeCd, 0.6);
-  stat(p.id, 'skills');
+  stat(p.team, 'skills');
   addText('SPIN-O-RAMA!', p.x, p.y - 18, '#ffd23f');
   burst(p.x, p.y, 12, GOLD_COLS, 80, 0.4, 2);
   sfx('spin');
@@ -1198,8 +1225,8 @@ function pushOutCircle(p, cx, cy, cr) {
     if (vn < 0) { p.vx -= vn * nx; p.vy -= vn * ny; }
   }
 }
-function playerPlayer() {
-  const a = P[0], b = P[1];
+function playerPlayer() { for (let i = 0; i < P.length; i++) for (let j = i + 1; j < P.length; j++) collide(P[i], P[j]); }
+function collide(a, b) {
   let dx = b.x - a.x, dy = b.y - a.y, d = Math.hypot(dx, dy);
   const m = PR * 2;
   if (d >= m) return;
@@ -1222,6 +1249,7 @@ function playerPlayer() {
   const aAp = Math.max(0, a.vx * nx + a.vy * ny), bAp = Math.max(0, -(b.vx * nx + b.vy * ny));
   const j = 1.45 * closing / (1 / ma + 1 / mb);
   a.vx -= nx * j / ma; a.vy -= ny * j / ma; b.vx += nx * j / mb; b.vy += ny * j / mb;
+  if (a.team === b.team) return;                      // teammates just bump off each other
   if (closing < 85) return;
   // a hard hit is a check: the harder-moving skater is the attacker
   const atk = aAp >= bAp ? a : b, vic = atk === a ? b : a;
@@ -1233,7 +1261,7 @@ function playerPlayer() {
     return;
   }
   vic.stun = Math.max(vic.stun, clamp((0.14 + (closing - 85) * 0.0028) * power, 0.12, 1.2));
-  stat(atk.id, 'hits');
+  stat(atk.team, 'hits');
   const sgn = vic === b ? 1 : -1, extra = Math.max(0, power - 1) * closing * 0.35;
   vic.vx += nx * sgn * extra; vic.vy += ny * sgn * extra;
   S.shake = Math.max(S.shake, power > 1.5 ? 6 : 3);
@@ -1254,7 +1282,7 @@ function castFire(p) {
   puck.vx = dx * FIRE_V; puck.vy = dy * FIRE_V;
   puck.fire = true; puck.owner = p.id; puck.ignT = 0.18;
   registerShot(p, true);
-  p.mana = 0; p.wasFull = false; stats[p.id].spells++;
+  p.mana = 0; p.wasFull = false; stats[p.team].spells++;
   S.shake = 4;
   burst(puck.x, puck.y, 22, FIRE_COLS, 130, 0.5, 5);
   addText('FIREBALL!', p.x, p.y - 18, '#ffb100');
@@ -1270,9 +1298,9 @@ function castIce(p) {
     w = { w: 44, h: 7, x: p.x - 22, y: p.y + Math.sign(s) * 24 - 3.5 };
   }
   w.x = clamp(w.x, L + 3, R - 3 - w.w); w.y = clamp(w.y, T + 3, B - 3 - w.h);
-  w.t = 3; w.age = 0; w.dead = false; w.owner = p.id;
+  w.t = 3; w.age = 0; w.dead = false; w.owner = p.team;
   walls.push(w);
-  p.mana = 0; p.wasFull = false; stats[p.id].spells++;
+  p.mana = 0; p.wasFull = false; stats[p.team].spells++;
   S.shake = 2;
   burst(w.x + w.w / 2, w.y + w.h / 2, 18, ICE_COLS, 90, 0.6, 4);
   addText('ICE WALL!', p.x, p.y - 18, '#8fd3ff');
@@ -1293,11 +1321,11 @@ function castSpell(p) {
 // Shadow Ninja: a fake puck streaks at the other goal and the goalie chases it
 function castClone(p) {
   if (S.mode !== 'play' || p.mana < 0.999 || p.stun > 0) return;
-  const tgt = p.id === 0 ? R : L;
+  const tgt = p.team === 0 ? R : L;
   const ty = CY + rnd(-MOUTH * 0.6, MOUTH * 0.6);
   const a = Math.atan2(ty - p.by, tgt - p.bx), sp = 150;
-  decoys.push({ x: p.bx, y: p.by, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 3, age: 0, owner: p.id });
-  p.mana = 0; p.wasFull = false; stats[p.id].spells++;
+  decoys.push({ x: p.bx, y: p.by, vx: Math.cos(a) * sp, vy: Math.sin(a) * sp, t: 3, age: 0, owner: p.team });
+  p.mana = 0; p.wasFull = false; stats[p.team].spells++;
   S.shake = Math.max(S.shake, 2);
   burst(p.x, p.y, 20, SMOKE_COLS, 90, 0.5, 4);
   burst(p.bx, p.by, 10, SMOKE_COLS, 60, 0.4, 3);
@@ -1308,7 +1336,7 @@ function castClone(p) {
 function castShield(p) {
   if (S.mode !== 'play' || p.mana < 0.999) return;
   p.shield = 4; p.stun = 0;
-  p.mana = 0; p.wasFull = false; stats[p.id].spells++;
+  p.mana = 0; p.wasFull = false; stats[p.team].spells++;
   S.shake = Math.max(S.shake, 2);
   burst(p.x, p.y - 2, 24, GOLD_COLS, 110, 0.6, 4);
   addText('HOLY SHIELD!', p.x, p.y - 18, '#ffd23f');
@@ -1319,8 +1347,8 @@ function castPotion(p) {
   if (S.mode !== 'play' || p.mana < 0.999 || p.stun > 0) return;
   let tx = p.x + Math.cos(p.ang) * 48, ty = p.y + Math.sin(p.ang) * 48;
   for (let i = 0; i < 24 && !insideRink(tx, ty, 14); i++) { tx += (240 - tx) * 0.12; ty += (CY - ty) * 0.12; }
-  puddles.push({ x: tx, y: ty, sx: p.x, sy: p.y - 6, r: 18, t: 7, age: 0, landed: false, owner: p.id });
-  p.mana = 0; p.wasFull = false; stats[p.id].spells++;
+  puddles.push({ x: tx, y: ty, sx: p.x, sy: p.y - 6, r: 18, t: 7, age: 0, landed: false, owner: p.team });
+  p.mana = 0; p.wasFull = false; stats[p.team].spells++;
   addText('POTION TOSS!', p.x, p.y - 18, '#7be08a');
   sfx('potion');
 }
@@ -1338,11 +1366,22 @@ const DIFF = [
   { name: 'NORMAL', spd: 0.86, react: 0.16, err: 5,  lead: 0.14, tol: 0.22, wall: 0.80, fireDelay: 0.25 },
   { name: 'HARD',   spd: 1.00, react: 0.14, err: 2,  lead: 0.24, tol: 0.14, wall: 1.00, fireDelay: 0.05 }
 ];
+function teamRank(p) {                           // 0 = the skater on p's team closest to the puck
+  const dp = Math.hypot(puck.x - p.x, puck.y - p.y);
+  let r = 0;
+  for (const q of P) if (q !== p && q.team === p.team && Math.hypot(puck.x - q.x, puck.y - q.y) < dp - 1e-6) r++;
+  return r;
+}
+function aiSpot(p, rank, dir) {                   // where a non-chasing bot stands: rank 1 = winger up the ice, rank 2+ = back defender
+  const ownX = p.team === 0 ? L : R, side = (p.id >> 1) % 2 ? 1 : -1;
+  if (rank === 1) return [clamp(puck.x + dir * 55, L + 30, R - 30), clamp(puck.y + side * 62, T + 14, B - 14)];
+  return [ownX + dir * (P.length > 4 ? 78 : 66), clamp((puck.y + CY) / 2 + side * 20, T + 20, B - 20)];
+}
 function aiThink(p, dt) {
   const D = DIFF[S.level];
-  const dir = p.id === 0 ? 1 : -1;               // direction this side attacks along x
-  const oppG = G[p.id === 0 ? 1 : 0];
-  const goalX = p.id === 0 ? R : L;
+  const dir = p.team === 0 ? 1 : -1;             // direction this side attacks along x
+  const oppG = G[p.team === 0 ? 1 : 0];
+  const goalX = p.team === 0 ? R : L;
   p.aiCd = Math.max(0, p.aiCd - dt);
   p.aiT -= dt;
 
@@ -1362,8 +1401,12 @@ function aiThink(p, dt) {
     const behind = rx * ux + ry * uy;
     const lateral = -rx * uy + ry * ux;
     let tx, ty;
-    const mine = puck.carrier === p.id, theirs = puck.carrier === 1 - p.id;
-    if (mine) {                                          // we have it: drive at the net
+    const mine = puck.carrier === p.id, theirs = puck.carrier >= 0 && P[puck.carrier].team !== p.team;
+    // TEAM ROLES for bots: only the teammate closest to the puck goes for it; the others take up supporting / defending spots
+    const rank = teamRank(p);
+    if (!mine && rank > 0) {
+      const t = aiSpot(p, rank, dir); tx = t[0]; ty = t[1];
+    } else if (mine) {                                          // we have it: drive at the net
       tx = goalX - dir * 10; ty = ay;
     } else if (theirs) {                                 // they have it: go and take it
       tx = px; ty = py;
@@ -1394,7 +1437,7 @@ function aiThink(p, dt) {
 
   // spells
   if (p.mana >= 0.999 && p.aiCd <= 0 && S.mode === 'play') {
-    const opp = P[1 - p.id];
+    const opp = nearOpp(p);
     const dOpp = Math.hypot(opp.x - p.x, opp.y - p.y);
     const dp = Math.hypot(puck.x - p.x, puck.y - p.y);
     switch (CH[p.char].spell) {
@@ -1419,7 +1462,7 @@ function aiThink(p, dt) {
         if (dp < 80 && (puck.x - 240) * dir > -40 && Math.random() < dt * 6) { castClone(p); p.aiCd = 1.5; }
         break;
       case 'shield': {                                   // block incoming checks / fireballs, or break out of a stun
-        const incoming = puck.fire && puck.owner !== p.id && dp < 110 && (puck.vx * (p.x - puck.x) + puck.vy * (p.y - puck.y)) > 0;
+        const incoming = puck.fire && puck.owner >= 0 && P[puck.owner].team !== p.team && dp < 110 && (puck.vx * (p.x - puck.x) + puck.vy * (p.y - puck.y)) > 0;
         const hit = dOpp < 42 && Math.hypot(opp.vx, opp.vy) > 55;
         if ((incoming || hit || p.stun > 0.2) && Math.random() < dt * 10) { castShield(p); p.aiCd = 1.5; }
         break;
@@ -1446,7 +1489,7 @@ function aiThink(p, dt) {
     if (p.stun <= 0 && p.spinT <= 0 && ((dg < range && Math.abs(da) < D.tol + 0.1) || (p.carryT > 3 && Math.abs(da) < 0.5))) {
       p.aiShooting = true; p.aiShoot = true; p.aiChgT = rnd(0.45, 1) * (S.level === 0 ? 0.6 : 1);
     }
-    const o = P[1 - p.id], od = Math.hypot(o.x - p.x, o.y - p.y);
+    const o = nearOpp(p), od = Math.hypot(o.x - p.x, o.y - p.y);
     if (od < 46 && p.dekeCd <= 0 && p.spinT <= 0 && p.stun <= 0 && Math.random() < dt * [0.8, 1.4, 2.0][S.level]) {
       if (p.spinCd <= 0 && Math.random() < 0.35) doSpin(p);
       else { doDeke(p, ((p.x - o.x) * -Math.sin(p.ang) + (p.y - o.y) * Math.cos(p.ang)) >= 0 ? 1 : -1); }
@@ -1462,7 +1505,7 @@ function dropPuck(c, vx, vy, cd) {
 // magnet + dribble: a loose puck near a skater snaps to the stick blade and stays glued to it
 function updatePossession(h) {
   if (puck.carrier >= 0) {
-    const c = P[puck.carrier], o = P[1 - c.id];
+    const c = P[puck.carrier], o = nearOpp(c, puck.x, puck.y);
     if (puck.fire) { puck.carrier = -1; }
     else if (c.stun > 0) {                                   // knocked off their feet: the puck squirts loose
       dropPuck(c, c.vx * 0.6 + rnd(-30, 30), c.vy * 0.6 + rnd(-30, 30), 0.6);
@@ -1474,7 +1517,7 @@ function updatePossession(h) {
         if (db < BR + puck.r + 1 || dbody < PR + puck.r + 1) {
           let nx = puck.x - c.x, ny = puck.y - c.y; const nl = Math.hypot(nx, ny) || 1; nx /= nl; ny /= nl;
           dropPuck(c, nx * 110 + o.vx * 0.4, ny * 110 + o.vy * 0.4, 0.5);
-          addText('STRIPPED!', puck.x, puck.y - 10, '#ffffff'); stat(o.id, 'steals');
+          addText('STRIPPED!', puck.x, puck.y - 10, '#ffffff'); stat(o.team, 'steals');
           burst(puck.x, puck.y, 6, ['#ffffff', '#c9e8f3'], 60, 0.3, 2); sfx('stick');
         }
       }
@@ -1557,13 +1600,13 @@ function stepPuck(h) {
     if (imp > 0.01) {
       if (imp > 40) sfx('hit');
       if (imp > 20) puck.snipe = -1;
-      if (imp > 20 && puck.shotOn && puck.shotTeam !== p.id) puck.shotOn = false;
-      if (imp > 60 && puck.fire && p.id !== puck.owner) {
+      if (imp > 20 && puck.shotOn && puck.shotTeam !== p.team) puck.shotOn = false;
+      if (imp > 60 && puck.fire && puck.owner >= 0 && P[puck.owner].team !== p.team) {      // fireballs only burn the other team
         if (p.shield > 0) {
           S.shake = 4; burst(p.x, p.y, 14, GOLD_COLS, 120, 0.4, 3);
           addText('BLOCKED!', p.x, p.y - 16, '#ffd23f'); sfx('shield');
         } else {
-          if (puck.owner >= 0) stat(puck.owner, 'hits');
+          if (puck.owner >= 0) stat(P[puck.owner].team, 'hits');
           p.stun = 0.9; p.vx += pvx * 0.45; p.vy += pvy * 0.45;
           puck.vx *= 0.6; puck.vy *= 0.6;
           S.shake = 6; burst(p.x, p.y, 16, FIRE_COLS, 120, 0.5, 4);
@@ -1576,7 +1619,7 @@ function stepPuck(h) {
       puck.vx += Math.cos(p.ang) * 45; puck.vy += Math.sin(p.ang) * 45;
       if (!puck.fire) puck.owner = p.id;
       puck.snipe = -1;
-      if (puck.shotOn && puck.shotTeam !== p.id) puck.shotOn = false;
+      if (puck.shotOn && puck.shotTeam !== p.team) puck.shotOn = false;
       registerShot(p, false);
       sfx('stick');
     }
@@ -1616,13 +1659,13 @@ function scoreGoal(team) {
   S.score[team]++;
   S.def = S.def || [0, 0];
   for (let t = 0; t < 2; t++) S.def[t] = Math.max(S.def[t], S.score[1 - t] - S.score[t]);   // biggest deficit each side has faced
-  if (puck.fire && puck.owner === team) unlock('fire', team);
+  if (puck.fire && puck.owner >= 0 && P[puck.owner].team === team) unlock('fire', team);
   if (S.ot) unlock('sudden', team);
   else {
     if (S.time > 0 && S.time <= 5) unlock('buzzer', team);
     if (MATCH_TIME - S.time <= 10) unlock('quick', team);
   }
-  if (!P[team].cpu && isMe(team)) { LIFE.goals++; saveLife(); if (LIFE.goals >= 25) unlock('machine', team); }
+  if (humanTeam(team)) { LIFE.goals++; saveLife(); if (LIFE.goals >= 25) unlock('machine', team); }
   stats[team].goals++;
   if (!(puck.shotOn && puck.shotTeam === team)) stats[team].shots++;   // a goal always counts as a shot...
   stats[team].onGoal++;                                                // ...on goal (shots on goal = goals + saves)
@@ -1640,7 +1683,7 @@ function endGame() {
     : (limit ? 'SCORE LIMIT REACHED!' : (S.ot ? 'SUDDEN DEATH WINNER!' : 'TIME UP!'));
   if (S.winner >= 0 && S.score[1 - S.winner] === 0) unlock('shutout', S.winner);
   if (S.winner >= 0 && S.def && S.def[S.winner] >= 2) unlock('comeback', S.winner);
-  const hum = NET.role ? NET.me : (!P[0].cpu ? 0 : (!P[1].cpu ? 1 : -1));
+  const hum = NET.role ? (P[NET.me] ? P[NET.me].team : -1) : (!P[0].cpu ? 0 : (!P[1].cpu ? 1 : -1));
   if (hum >= 0) { LIFE.matches++; saveLife(); if (LIFE.matches >= 10) unlock('regular', hum); }
   awardXp();
   sfx('over');
@@ -1655,17 +1698,32 @@ const PF = ['x', 'y', 'vx', 'vy', 'ang', 'face', 'char', 'shield', 'oil', 'stun'
 const STAT_KEYS = ['shots', 'onGoal', 'goals', 'saves', 'spells', 'hits', 'skills', 'blocks', 'slips', 'steals'];
 const rd = (v, d) => Math.round(v * d) / d;
 const num = (v, d = 0) => (typeof v === 'number' && isFinite(v)) ? v : d;
-function netSend(m) { try { if (NET.conn && NET.conn.open) NET.conn.send(m); } catch (e) {} }
+// Host: broadcast to every connected client. Guest: send to the host.
+function netSend(m) {
+  try {
+    if (NET.role === 'host') { for (const r of NET.peers) if (r.conn.open) r.conn.send(m); }
+    else if (NET.conn && NET.conn.open) NET.conn.send(m);
+  } catch (e) {}
+}
+function netTo(r, m) { try { if (r.conn.open) r.conn.send(m); } catch (e) {} }
+const MODES = [2, 4, 6];                                              // players per match: 1v1, 2v2, 3v3
+const modeName = n => (n / 2) + 'V' + (n / 2);
+const JOIN_ORDER = [1, 2, 3, 4, 5];                                   // joiners fill Blue1, Red2, Blue2, Red3, Blue3 -> teams stay balanced
+const cleanName = v => String(v || 'PLAYER').toUpperCase().replace(/[^A-Z0-9 \-]/g, '').slice(0, 10) || 'PLAYER';
 function myPick() { return S.cpu ? S.chars[humanId()] : S.chars[0]; }
 function openLobby() { sanitizeChars(); S.mode = 'lobby'; S.lob = { st: 'menu', code: '', msg: '' }; sfx('tick'); }
 function leaveLobby() { netClose(); S.lob = null; S.mode = 'title'; S.tab = 0; sfx('tick'); }
 function lobErr(msg) { netClose(); S.mode = 'lobby'; S.lob = { st: 'menu', code: '', msg }; sfx('deny'); }
 function netClose() {
-  if (NET.conn) { try { netSend({ t: 'bye' }); NET.conn.close(); } catch (e) {} }
+  if (NET.role === 'host') NET.peers.forEach(r => { netTo(r, { t: 'bye' }); try { r.conn.close(); } catch (e) {} });
+  else if (NET.conn) { netSend({ t: 'bye' }); try { NET.conn.close(); } catch (e) {} }
   if (NET.peer) { try { NET.peer.destroy(); } catch (e) {} }
   if (NET.inMatch && NET.saved) { S.chars = NET.saved.chars; S.cpu = NET.saved.cpu; }
   NET.saved = null; NET.role = null; NET.conn = null; NET.peer = null; NET.inMatch = false; NET.ev = []; NET.rem = false;
-  NET.inp.ix = NET.inp.iy = 0; NET.inp.sh = false; P.forEach(p => { p.net = null; });
+  NET.peers = []; NET.roster = []; NET.lobby = null; NET.code = '';
+  NET.inp.ix = NET.inp.iy = 0; NET.inp.sh = false;
+  P.forEach(p => { p.net = null; });
+  if (P.length !== 2) buildRoster(2);                                 // back to the normal two-skater game
 }
 function netLost(msg) {
   if (!NET.role) return;
@@ -1673,40 +1731,23 @@ function netLost(msg) {
   netClose(); toMenu();
   S.mode = 'lobby'; S.lob = { st: 'menu', code: '', msg: msg || (was ? 'OPPONENT LEFT THE MATCH' : 'DISCONNECTED') }; sfx('deny');
 }
+
+// ---- GUEST: one connection to the host ---------------------------------------------------------------------------------------------
 function netAttach(c) {
   NET.conn = c;
-  c.on('open', () => { netSend({ t: 'hello', char: myPick() }); NET.lastRx = performance.now(); });
-  c.on('data', m => { NET.lastRx = performance.now(); netData(m); });
-  c.on('close', () => { if (NET.conn === c) netLost(); });
+  c.on('open', () => { netSend({ t: 'hello', char: myPick(), name: 'PLAYER' }); NET.lastRx = performance.now(); });
+  c.on('data', m => { NET.lastRx = performance.now(); guestData(m); });
+  c.on('close', () => { if (NET.conn === c) netLost('HOST LEFT'); });
   c.on('error', () => { if (NET.conn === c) netLost('CONNECTION ERROR'); });
-}
-function netHost(tries = 0) {
-  if (typeof Peer === 'undefined') { lobErr('ONLINE NEEDS THE INTERNET - COULD NOT LOAD'); return; }
-  netClose();
-  const code = Array.from({ length: 5 }, () => NET_ALPHA[Math.floor(Math.random() * NET_ALPHA.length)]).join('');
-  NET.role = 'host'; NET.me = 0; S.lob = { st: 'hosting', code: '', msg: 'CREATING ROOM...' };
-  try {
-    const peer = NET.peer = new Peer(NET_PREFIX + code);
-    peer.on('open', () => { if (NET.peer === peer) { S.lob.code = code; S.lob.msg = 'WAITING FOR A PLAYER...'; } });
-    peer.on('connection', c => {
-      if (NET.conn && NET.conn.open) { c.on('open', () => { try { c.send({ t: 'bye' }); c.close(); } catch (e) {} }); return; }
-      netAttach(c);
-    });
-    peer.on('error', e => {
-      if (NET.peer !== peer) return;
-      if (e && e.type === 'unavailable-id' && tries < 3) netHost(tries + 1);
-      else lobErr('COULD NOT CREATE ROOM (' + ((e && e.type) || 'ERROR').toUpperCase().replace(/-/g, ' ') + ')');
-    });
-  } catch (e) { lobErr('COULD NOT CREATE ROOM'); }
 }
 function netJoin() {
   const code = S.lob.code;
   if (code.length !== 5) { S.lob.msg = 'ROOM CODES ARE 5 CHARACTERS'; sfx('deny'); return; }
   if (typeof Peer === 'undefined') { lobErr('ONLINE NEEDS THE INTERNET - COULD NOT LOAD'); return; }
   netClose();
-  NET.role = 'guest'; NET.me = 1; S.lob = { st: 'connecting', code, msg: 'CONNECTING...' };
+  NET.role = 'guest'; NET.me = 1; NET.joinCode = code; S.lob = { st: 'connecting', code, msg: 'CONNECTING...' };
   try {
-    const peer = NET.peer = new Peer();
+    const peer = NET.peer = new Peer();                               // guests get a random id; only the host needs a known one
     peer.on('open', () => {
       if (NET.peer !== peer) return;
       netAttach(peer.connect(NET_PREFIX + code, { reliable: true, serialization: 'json' }));
@@ -1718,50 +1759,144 @@ function netJoin() {
     setTimeout(() => { if (NET.peer === peer && S.lob && S.lob.st === 'connecting') lobErr('CONNECTION TIMED OUT'); }, 15000);
   } catch (e) { lobErr('COULD NOT CONNECT'); }
 }
-function netData(m) {
+function guestData(m) {                                               // everything the host can tell a guest
   if (!m || typeof m !== 'object') return;
   switch (m.t) {
-    case 'hello':
-      NET.peerChar = clamp(num(m.char) | 0, 0, CH.length - 1);
-      if (S.lob) { S.lob.st = 'ready'; S.lob.msg = ''; }
+    case 'welcome':                                                   // the host gave me a slot
+      NET.me = clamp(num(m.slot) | 0, 0, 5);
+      if (S.lob && S.lob.st === 'connecting') { S.lob.st = 'ready'; S.lob.msg = ''; }
       sfx('ready'); break;
-    case 'bye': netLost('OPPONENT LEFT'); break;
-    case 'in':                                                       // host: the guest's controls (key states, never positions)
-      if (NET.role !== 'host' || m.mid !== NET.mid) break;           // ignore packets left over from a previous match
-      NET.inp.ix = (m.right ? 1 : 0) - (m.left ? 1 : 0); NET.inp.iy = (m.down ? 1 : 0) - (m.up ? 1 : 0); NET.inp.sh = !!m.shoot;
-      if (num(m.q) > NET.ack) NET.ack = num(m.q);                    // echoed back in every snapshot so the guest knows what we've applied
-      break;
-    case 'sp': if (NET.role === 'host' && NET.inMatch && S.mode === 'play') castSpell(P[1]); break;
-    case 'sk': if (NET.role === 'host' && NET.inMatch) useSkill(P[1]); break;
-    case 'rem': if (NET.role === 'host' && S.mode === 'over') { S.remReq = true; sfx('ready'); } break;
-    case 'start': if (NET.role === 'guest') guestStart(m); break;
-    case 's': if (NET.role === 'guest' && NET.inMatch) netApply(m); break;
+    case 'lobby': NET.lobby = { n: clamp(num(m.n, 2) | 0, 2, 6), slots: Array.isArray(m.slots) ? m.slots.slice(0, 6) : [] }; break;
+    case 'full': lobErr(String(m.why || 'ROOM IS FULL').slice(0, 40)); break;
+    case 'bye': netLost('HOST LEFT'); break;
+    case 'start': guestStart(m); break;
+    case 's': if (NET.inMatch) netApply(m); break;
   }
 }
-function lobbyStartMatch() {                                         // host: SPACE in the lobby
-  if (NET.role !== 'host' || !S.lob || S.lob.st !== 'ready') return;
+
+// ---- HOST: accepts up to 5 clients, each in its own slot ----------------------------------------------------------------------------------
+function netHost(tries = 0) {
+  if (typeof Peer === 'undefined') { lobErr('ONLINE NEEDS THE INTERNET - COULD NOT LOAD'); return; }
+  netClose();
+  const code = Array.from({ length: 5 }, () => NET_ALPHA[Math.floor(Math.random() * NET_ALPHA.length)]).join('');
+  NET.role = 'host'; NET.me = 0; S.lob = { st: 'hosting', code: '', msg: 'CREATING ROOM...' };
+  try {
+    const peer = NET.peer = new Peer(NET_PREFIX + code);
+    peer.on('open', () => { if (NET.peer === peer) { NET.code = code; S.lob.code = code; S.lob.msg = ''; lobbySync(); } });
+    peer.on('connection', c => hostAccept(c));                        // fires once per joining player: there is no limit of one
+    peer.on('error', e => {
+      if (NET.peer !== peer) return;
+      if (e && e.type === 'unavailable-id' && tries < 3) netHost(tries + 1);
+      else lobErr('COULD NOT CREATE ROOM (' + ((e && e.type) || 'ERROR').toUpperCase().replace(/-/g, ' ') + ')');
+    });
+  } catch (e) { lobErr('COULD NOT CREATE ROOM'); }
+}
+function hostAccept(c) {
+  const r = { conn: c, slot: -1, char: 0, name: 'PLAYER', inp: { ix: 0, iy: 0, sh: false, ack: 0 }, lastRx: performance.now() };
+  c.on('open', () => {
+    if (NET.inMatch || NET.peers.length >= NET.mode - 1) {            // room full / match running: politely refuse
+      try { c.send({ t: 'full', why: NET.inMatch ? 'MATCH ALREADY STARTED' : 'ROOM IS FULL' }); } catch (e) {}
+      setTimeout(() => { try { c.close(); } catch (e) {} }, 300); return;
+    }
+    NET.peers.push(r);                                                // slot is handed out when its 'hello' arrives
+  });
+  c.on('data', m => { r.lastRx = performance.now(); hostData(r, m); });
+  c.on('close', () => peerGone(r));
+  c.on('error', () => peerGone(r));
+}
+function hostData(r, m) {                                             // a message from one client (r tells us which)
+  if (!m || typeof m !== 'object' || !NET.peers.includes(r)) return;
+  switch (m.t) {
+    case 'hello': {
+      if (r.slot >= 0 || NET.inMatch) break;
+      const slot = JOIN_ORDER.find(sl => sl < NET.mode && !NET.peers.some(q => q.slot === sl));
+      if (slot === undefined) { netTo(r, { t: 'full', why: 'ROOM IS FULL' }); break; }
+      r.slot = slot; r.char = clamp(num(m.char) | 0, 0, CH.length - 1); r.name = cleanName(m.name);
+      netTo(r, { t: 'welcome', slot, mode: NET.mode });
+      lobbySync(); sfx('ready'); break;
+    }
+    case 'in':                                                        // this client's controls: key states, never positions
+      if (m.mid !== NET.mid || r.slot < 0) break;                     // ignore packets left over from a previous match
+      r.inp.ix = (m.right ? 1 : 0) - (m.left ? 1 : 0); r.inp.iy = (m.down ? 1 : 0) - (m.up ? 1 : 0); r.inp.sh = !!m.shoot;
+      if (num(m.q) > r.inp.ack) r.inp.ack = num(m.q);                 // echoed back (per slot) in every snapshot
+      break;
+    case 'sp': if (NET.inMatch && S.mode === 'play' && P[r.slot]) castSpell(P[r.slot]); break;
+    case 'sk': if (NET.inMatch && P[r.slot]) useSkill(P[r.slot]); break;
+    case 'rem': if (S.mode === 'over') { S.remReq = true; sfx('ready'); } break;
+    case 'bye': peerGone(r); break;
+  }
+}
+function peerGone(r) {
+  const i = NET.peers.indexOf(r); if (i < 0) return;
+  NET.peers.splice(i, 1);
+  if (NET.inMatch && r.slot >= 0) {
+    const p = P[r.slot];                                              // a bot takes over the skater who dropped out
+    if (p) { p.cpu = true; p.net = null; p.aiT = 0; addText('CPU TOOK OVER', p.x, p.y - 20, '#ffd23f'); }
+    if (NET.roster[r.slot]) NET.roster[r.slot].cpu = true;
+    if (!NET.peers.some(q => q.slot >= 0)) hostBackToLobby('EVERYONE LEFT');
+  } else lobbySync();
+}
+function hostBackToLobby(msg) {                                       // the room stays open, the match is abandoned
+  NET.inMatch = false;
+  if (NET.saved) { S.chars = NET.saved.chars; S.cpu = NET.saved.cpu; NET.saved = null; }
+  P.forEach(p => { p.net = null; });
+  buildRoster(2); particles.length = 0; texts.length = 0; resetPositions();
+  S.mode = 'lobby'; S.lob = { st: 'hosting', code: NET.code, msg }; lobbySync(); sfx('deny');
+}
+// What the lobby shows (and what clients are told): one entry per slot -> { h: human?, n: name, c: fighter }
+function lobbySlots() {
+  if (NET.role === 'host') {
+    const slots = [];
+    for (let i = 0; i < NET.mode; i++) {
+      const r = NET.peers.find(q => q.slot === i);
+      slots.push(i === 0 ? { h: 1, n: 'HOST', c: myPick() } : r ? { h: 1, n: r.name, c: r.char } : { h: 0 });
+    }
+    return { n: NET.mode, slots };
+  }
+  return NET.lobby || { n: 2, slots: [{ h: 1, n: 'HOST', c: 0 }, { h: 1, n: 'YOU', c: myPick() }] };
+}
+function lobbySync() { if (NET.role === 'host') { const l = lobbySlots(); netSend({ t: 'lobby', n: l.n, slots: l.slots }); } }
+function setLobbyMode(n) {                                            // host picks 1v1 / 2v2 / 3v3
+  if (NET.role !== 'host' || NET.inMatch || !MODES.includes(n) || n === NET.mode || !S.lob) return;
+  if (NET.peers.some(r => r.slot >= n)) { S.lob.msg = 'PLAYERS ALREADY IN SLOTS ABOVE ' + modeName(n); sfx('deny'); return; }
+  NET.mode = n; S.lob.msg = ''; lobbySync(); sfx('tick');
+}
+function lobbyStartMatch() {                                          // host: SPACE in the room
+  if (NET.role !== 'host' || !S.lob || S.lob.st !== 'hosting' || !NET.code) return;
   NET.saved = { chars: S.chars.slice(), cpu: S.cpu };
-  S.cpu = false; S.chars = [myPick(), NET.peerChar];
-  NET.inMatch = true; P[1].net = NET.inp; NET.inp.ix = NET.inp.iy = 0; NET.inp.sh = false;
+  S.cpu = false;
+  buildRoster(NET.mode);
+  // every slot: a connected human gets their own controls (p.net), anyone missing becomes a bot with a random fighter
+  NET.roster = P.map((p, i) => {
+    const r = NET.peers.find(q => q.slot === i);
+    if (i === 0) return { char: myPick(), cpu: false };
+    return r ? { char: r.char, cpu: false } : { char: Math.floor(Math.random() * CH.length), cpu: true };
+  });
+  P.forEach((p, i) => { const r = NET.peers.find(q => q.slot === i); p.net = r ? r.inp : null; if (r) { r.inp.ix = r.inp.iy = 0; r.inp.sh = false; } });
+  NET.inMatch = true;
   startGame();
 }
 function rematch() {
   if (NET.role === 'guest') { if (!NET.rem) { NET.rem = true; netSend({ t: 'rem' }); sfx('tick'); } }
   else startGame();
 }
-function guestStart(m) {
+function guestStart(m) {                                              // the host says "go": build the same roster here
   if (!NET.saved) NET.saved = { chars: S.chars.slice(), cpu: S.cpu };
+  const n = MODES.includes(num(m.n) | 0) ? m.n | 0 : 2;
   NET.inMatch = true; NET.rem = false; NET.mid = num(m.mid) | 0; NET.seq = 0; NET.hist = []; NET.lastSig = ''; NET.nextIn = 0; NET.first = true; NET.pOK = true; NET.pacc = 0;
-  S.chars = [clamp(num(m.chars && m.chars[0]) | 0, 0, CH.length - 1), clamp(num(m.chars && m.chars[1]) | 0, 0, CH.length - 1)];
+  if (P.length !== n) buildRoster(n);
+  NET.me = clamp(num(m.you) | 0, 0, n - 1);
   S.cpu = false; S.score = [0, 0]; S.time = MATCH_TIME; S.ot = false; S.winner = -1; S.xpRes = null; S.resSel = 0;
-  P.forEach(p => { p.cpu = false; p.net = null; p.char = S.chars[p.id]; p.spd = CH[p.char].spd; });
+  P.forEach((p, i) => {
+    const sl = (m.slots && m.slots[i]) || {};
+    p.cpu = !!sl.cpu; p.net = null; p.char = clamp(num(sl.char) | 0, 0, CH.length - 1); p.spd = CH[p.char].spd;
+  });
   particles.length = 0; texts.length = 0; resetPositions();
   P.forEach(p => { p.rx = p.x; p.ry = p.y; p.rbx = p.bx; p.rby = p.by; p.ex = p.ey = 0; });
   puck.rx = puck.x; puck.ry = puck.y; puck.ex = puck.ey = 0; NET.pred = predState(P[NET.me]);
   stats[0] = mkStats(); stats[1] = mkStats();
   S.mode = 'intro'; S.introT = 0; S.cd = 2.4; S.lob = null;
 }
-// ---- host: build + send the state snapshot -------------------------------------------------------------
 // Fixed-rate timer on timestamps: fires once per 1000/hz ms no matter whether the screen runs at 60, 144 or 240 Hz.
 function due(slot, now, hz) {
   const iv = 1000 / hz;
@@ -1771,14 +1906,14 @@ function due(slot, now, hz) {
 }
 function hostTick(dt) {
   const now = performance.now();
-  if (now - NET.lastRx > 7000) { netLost('CONNECTION LOST'); return; }
-  if (!due('nextSend', now, NET_HZ)) return;                         // host physics runs every frame in fixed 1/120 s steps; we only *broadcast* at 60 Hz
+  for (const r of NET.peers.slice()) if (now - r.lastRx > 7000) peerGone(r);      // a silent client is replaced by a bot
+  if (!NET.inMatch || !due('nextSend', now, NET_HZ)) return;                         // host physics runs every frame in fixed 1/120 s steps; we only *broadcast* at 60 Hz
   NET.snapN++;
   const slow = S.mode === 'over' || S.mode === 'goal' || NET.snapN % 20 === 0;      // match stats change rarely: send them occasionally
   const snap = {
     t: 's', mo: S.mode, tm: rd(S.time, 100), ot: S.ot ? 1 : 0, cd: rd(S.cd, 100), gt: rd(S.goalT, 100), gb: S.goalBy, gbn: rd(S.goBanner, 100),
     it: rd(S.introT, 100), sc: S.score.slice(), w: S.winner, er: S.endReason || '', sk: rd(S.shake, 10), fl: rd(S.flash, 100),
-    ak: NET.ack,                                                     // last guest input packet applied -> lets the guest replay only the newer ones
+    ak: P.map(p => p.net ? p.net.ack : 0),                           // per slot: last input packet applied -> each guest replays only the newer ones
     p: P.map(p => PF.map(k => rd(p[k], k === 'x' || k === 'y' || k === 'bx' || k === 'by' ? 10 : 100))),
     g: G.map(g => [rd(g.y, 10), rd(g.stun, 100), rd(g.vy, 10)]),
     pk: [rd(puck.x, 10), rd(puck.y, 10), rd(puck.vx, 10), rd(puck.vy, 10), puck.fire ? 1 : 0, puck.carrier],
@@ -1797,8 +1932,9 @@ function netApply(m) {
   S.introT = num(m.it); S.score = [num(m.sc && m.sc[0]), num(m.sc && m.sc[1])]; S.winner = num(m.w, -1); S.endReason = String(m.er || '');
   S.shake = Math.max(S.shake, num(m.sk)); S.flash = Math.max(S.flash, num(m.fl));
   // ---- reconciliation: the host's snapshot is the truth; we blend toward it instead of snapping --------------------
-  NET.ackSeen = num(m.ak);
+  NET.ackSeen = num(m.ak && m.ak[NET.me]);
   const first = NET.first; NET.first = false;
+  if ((m.p || []).length !== P.length) return;                       // snapshot for a different roster: ignore
   (m.p || []).forEach((a, i) => {
     const p = P[i]; if (!p) return;
     const sn = {}; PF.forEach((k, j) => { sn[k] = num(a[j]); });
@@ -1844,6 +1980,7 @@ function netApply(m) {
       else if (e[0] === 'b') burst(e[1], e[2], e[3], e[4], e[5], e[6], e[7], e[8]);
       else if (e[0] === 't') addText(e[1], e[2], e[3], e[4]);
       else if (e[0] === 'c') confetti(e[1]);
+      else if (e[0] === 'r' && e[1] === NET.me) sfx('ready');                // "your spell is ready" is only for the skater it belongs to
     } catch (x) {}
   });
   if (m.mo === 'intro' && prev !== 'intro') { particles.length = 0; texts.length = 0; }
@@ -1913,7 +2050,7 @@ function guestTick(dt) {
   const m = S.mode;
   if (m === 'intro') S.introT += dt; else if (m === 'countdown') S.cd -= dt; else if (m === 'goal') S.goalT -= dt;
   const live = m === 'play' || m === 'goal' || m === 'countdown';
-  const me = P[NET.me], pr = NET.pred;
+  const me = P[NET.me], pr = NET.pred;                               // NET.me = my slot
   // ---- CLIENT-SIDE PREDICTION: my own skater reacts to my keys this very frame, in the same fixed 1/120 s steps the host uses ----
   if (pr) {
     const inp = m === 'play' ? guestInput() : { ix: 0, iy: 0 };
@@ -1938,7 +2075,7 @@ function guestTick(dt) {
   }
   // ---- SMOOTHING: whatever error the last snapshot revealed fades out exponentially (frame-rate independent) ----
   const f = Math.exp(-CORR_RATE * dt);
-  for (const o of [P[0], P[1], puck]) { o.ex *= f; o.ey *= f; }
+  for (const o of [...P, puck]) { o.ex *= f; o.ey *= f; }
   for (const p of P) { p.x = p.rx + p.ex; p.y = p.ry + p.ey; p.bx = p.rbx + p.ex; p.by = p.rby + p.ey; }
   puck.x = puck.rx + puck.ex; puck.y = puck.ry + puck.ey;
   walls.forEach(w => { w.t -= dt; w.age += dt; });
@@ -1966,91 +2103,210 @@ function guestPress(c) {
     else if (c === 'Space' || c === 'Enter') { if (S.resSel === 0) rematch(); else toMenu(); }
   }
 }
-// ---- lobby screen -------------------------------------------------------------------------------------------------
+// ---- friends list & saved rooms (kept in localStorage, so they survive a reload) ----------------------------------------
+const FR_KEY = 'spellblade_friends_v1';
+let FRIENDS = [];
+try {
+  const d = JSON.parse(localStorage.getItem(FR_KEY) || '[]');
+  if (Array.isArray(d)) FRIENDS = d.filter(f => f && typeof f.n === 'string' && typeof f.c === 'string').slice(0, 30).map(f => ({ n: cleanName(f.n), c: f.c.toUpperCase().slice(0, 5) }));
+} catch (e) {}
+function saveFriends() { try { localStorage.setItem(FR_KEY, JSON.stringify(FRIENDS)); } catch (e) {} }
+function typed(c, codeOnly) {                                         // keyboard code -> the character it types ('' if none)
+  let ch = '';
+  if (c.startsWith('Key')) ch = c.slice(3); else if (c.startsWith('Digit')) ch = c.slice(5);
+  else if (!codeOnly && c === 'Space') ch = ' '; else if (!codeOnly && c === 'Minus') ch = '-';
+  return (codeOnly && !NET_ALPHA.includes(ch)) ? '' : ch;
+}
+function joinFriend(f) { S.lob = { st: 'joining', code: f.c, msg: '' }; netJoin(); }      // quick-connect: straight into their room
+function addFriendFlow(prefillCode, ret) { S.lob = { st: 'fname', nick: '', code: prefillCode || '', msg: '', ret: ret || 'friends' }; }
 function lobbyPress(c) {
   const L = S.lob; if (!L) return;
   if (c === 'Escape') {
-    if (L.st === 'joining' || (L.st === 'menu')) { if (L.st === 'menu') leaveLobby(); else { L.st = 'menu'; L.msg = ''; sfx('tick'); } }
-    else leaveLobby();
+    if (L.st === 'menu' || L.st === 'hosting' || L.st === 'connecting') leaveLobby();
+    else if (L.st === 'fname' || L.st === 'fcode') { if (L.ret === 'ready') { L.st = 'ready'; } else { S.lob = { st: 'friends', sel: 0, scroll: 0, msg: '' }; } sfx('tick'); }
+    else if (L.st === 'ready') leaveLobby();
+    else { S.lob = { st: 'menu', code: '', msg: '' }; sfx('tick'); }                 // joining / friends -> back to the lobby menu
     return;
   }
   if (L.st === 'menu') {
     if (c === 'KeyH') netHost();
     else if (c === 'KeyJ') { S.lob = { st: 'joining', code: '', msg: '' }; sfx('tick'); }
+    else if (c === 'KeyF') { S.lob = { st: 'friends', sel: 0, scroll: 0, msg: '' }; sfx('tick'); }
   } else if (L.st === 'joining') {
     if (c === 'Enter') netJoin();
     else if (c === 'Backspace') { L.code = L.code.slice(0, -1); L.msg = ''; }
-    else {
-      const ch = c.startsWith('Key') ? c.slice(3) : (c.startsWith('Digit') ? c.slice(5) : '');
-      if (ch.length === 1 && NET_ALPHA.includes(ch) && L.code.length < 5) { L.code += ch; L.msg = ''; sfx('tick'); }
-    }
-  } else if (L.st === 'ready' && NET.role === 'host' && (c === 'Space' || c === 'Enter')) lobbyStartMatch();
+    else { const ch = typed(c, true); if (ch && L.code.length < 5) { L.code += ch; L.msg = ''; sfx('tick'); } }
+  } else if (L.st === 'hosting') {
+    if (c === 'Space' || c === 'Enter') lobbyStartMatch();
+    else if (c === 'Digit1' || c === 'Numpad1') setLobbyMode(2);
+    else if (c === 'Digit2' || c === 'Numpad2') setLobbyMode(4);
+    else if (c === 'Digit3' || c === 'Numpad3') setLobbyMode(6);
+    else if (c === 'ArrowLeft' || c === 'ArrowRight') setLobbyMode(MODES[clamp(MODES.indexOf(NET.mode) + (c === 'ArrowRight' ? 1 : -1), 0, 2)]);
+    else if (c === 'KeyL') { S.level = (S.level + 1) % 3; sfx('tick'); }                // difficulty of the bots
+  } else if (L.st === 'ready') {
+    if (c === 'KeyS') addFriendFlow(NET.joinCode, 'ready');                              // save the room I'm in
+  } else if (L.st === 'friends') {
+    if (c === 'ArrowUp') L.sel = Math.max(0, L.sel - 1);
+    else if (c === 'ArrowDown') L.sel = Math.min(FRIENDS.length - 1, L.sel + 1);
+    else if ((c === 'Enter' || c === 'KeyJ') && FRIENDS[L.sel]) joinFriend(FRIENDS[L.sel]);
+    else if (c === 'KeyN') addFriendFlow('', 'friends');
+    else if ((c === 'KeyX' || c === 'Delete') && FRIENDS[L.sel]) { FRIENDS.splice(L.sel, 1); L.sel = clamp(L.sel, 0, Math.max(0, FRIENDS.length - 1)); saveFriends(); sfx('deny'); }
+    if (L.sel < L.scroll) L.scroll = L.sel; if (L.sel > L.scroll + 6) L.scroll = L.sel - 6;          // keep the selected row on screen
+  } else if (L.st === 'fname') {
+    if (c === 'Enter') { if (L.nick.trim()) { L.st = 'fcode'; sfx('tick'); } else sfx('deny'); }
+    else if (c === 'Backspace') L.nick = L.nick.slice(0, -1);
+    else { const ch = typed(c, false); if (ch && L.nick.length < 10) L.nick += ch; }
+  } else if (L.st === 'fcode') {
+    if (c === 'Enter') {
+      if (L.code.length !== 5) { L.msg = 'ROOM CODES ARE 5 CHARACTERS'; sfx('deny'); return; }
+      const nick = cleanName(L.nick), ex = FRIENDS.find(f => f.c === L.code);
+      if (ex) ex.n = nick; else if (FRIENDS.length < 30) FRIENDS.push({ n: nick, c: L.code });
+      saveFriends(); sfx('ach');
+      if (L.ret === 'ready') { S.lob = { st: 'ready', msg: '', saved: nick }; } else S.lob = { st: 'friends', sel: FRIENDS.findIndex(f => f.c === L.code), scroll: 0, msg: 'SAVED ' + nick };
+    } else if (c === 'Backspace') { L.code = L.code.slice(0, -1); L.msg = ''; }
+    else { const ch = typed(c, true); if (ch && L.code.length < 5) { L.code += ch; L.msg = ''; } }
+  }
 }
 function lobbyClick(x, y) {
   const L = S.lob; if (!L) return;
+  if (y >= 262 && L.st !== 'hosting') { lobbyPress('Escape'); return; }
   if (L.st === 'menu') {
-    if (y >= 96 && y < 116) netHost();
-    else if (y >= 124 && y < 144) { S.lob = { st: 'joining', code: '', msg: '' }; sfx('tick'); }
-    else if (y >= 250) leaveLobby();
-  } else if (L.st === 'ready' && NET.role === 'host' && y >= 215 && y < 240) lobbyStartMatch();
-  else if (y >= 262) { if (L.st === 'joining') { L.st = 'menu'; L.msg = ''; } else leaveLobby(); }
+    if (y >= 90 && y < 120) netHost();
+    else if (y >= 124 && y < 154) { S.lob = { st: 'joining', code: '', msg: '' }; sfx('tick'); }
+    else if (y >= 158 && y < 188) lobbyPress('KeyF');
+  } else if (L.st === 'hosting') {
+    if (y >= 262) { leaveLobby(); return; }
+    if (y >= 50 && y < 78) { for (let i = 0; i < 3; i++) if (x >= 262 + i * 62 && x < 262 + i * 62 + 56) setLobbyMode(MODES[i]); }
+    else if (y >= 204 && y < 224) lobbyStartMatch();
+  } else if (L.st === 'friends') {
+    if (y >= 240 && y < 258 && x < 240) { lobbyPress('KeyN'); return; }
+    const top = clamp(L.scroll || 0, 0, Math.max(0, FRIENDS.length - 7));
+    for (let i = 0; i < 7; i++) {
+      const f = FRIENDS[top + i], ry = 56 + i * 24; if (!f) break;
+      if (y >= ry && y < ry + 21 && x >= 20 && x < 460) {
+        L.sel = top + i;
+        if (x >= 372 && x < 436) joinFriend(f);                                          // the JOIN button
+        else if (x >= 440) { FRIENDS.splice(top + i, 1); L.sel = clamp(L.sel, 0, Math.max(0, FRIENDS.length - 1)); saveFriends(); sfx('deny'); }
+      }
+    }
+  } else if (L.st === 'ready' && x >= 100 && x < 380 && y >= 226 && y < 246) lobbyPress('KeyS');
+}
+function drawCodeBoxes(code, y, active) {
+  for (let i = 0; i < 5; i++) {
+    const x = 240 - 110 + i * 44;
+    ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x, y, 40, 46);
+    ctx.fillStyle = i === code.length && active ? '#ffd23f' : '#3a4175'; ctx.fillRect(x + 2, y + 2, 36, 42);
+    ctx.fillStyle = '#14182b'; ctx.fillRect(x + 4, y + 4, 32, 38);
+    if (code[i]) txt(code[i], x + 20, y + 12, 24, '#ffffff', 'center');
+  }
+}
+// Red column (even slots) and Blue column (odd slots); every skater has a colour chip + tag that match what you see on the ice
+function drawRoster(y, info) {
+  const per = info.n / 2;
+  [0, 1].forEach(team => {
+    const cx = team ? 250 : 20, col = team ? '#2a6fdb' : '#d62839', light = team ? '#8fd3ff' : '#ff7a59';
+    txt((team ? 'BLUE' : 'RED') + ' TEAM', cx + 105, y, 8, light, 'center');
+    for (let k = 0; k < per; k++) {
+      const slot = k * 2 + team, sl = info.slots[slot] || { h: 0 }, ry = y + 13 + k * 27;
+      ctx.fillStyle = col; ctx.fillRect(cx, ry, 210, 25);
+      ctx.fillStyle = '#14182b'; ctx.fillRect(cx + 2, ry + 2, 206, 21);
+      ctx.fillStyle = SLOT_COL[slot]; ctx.fillRect(cx + 4, ry + 4, 6, 17);
+      const who = sl.h ? (slot === 0 ? 'HOST' : cleanName(sl.n)) : 'CPU BOT';
+      txt(slotLabel(slot) + ' ' + who + (slot === NET.me ? ' (YOU)' : ''), cx + 16, ry + 4, 8, sl.h ? '#ffffff' : '#7f8bb5');
+      const ch = CH[clamp(num(sl.c) | 0, 0, CH.length - 1)];
+      if (sl.h) txt(ch.name, cx + 16, ry + 14, 8, ch.col); else txt('OPEN - BOT FILLS IN', cx + 16, ry + 14, 8, '#5b6590');
+    }
+  });
 }
 function drawLobby() {
   const L = S.lob || { st: 'menu', code: '', msg: '' };
   ctx.fillStyle = 'rgba(11,13,26,.97)'; ctx.fillRect(0, 0, W, H);
   const blink = Math.floor(S.t * 3) % 2;
-  txt('ONLINE PLAY', 240, 18, 16, '#ffd23f', 'center', '#7a1a1a');
-  txt('1 VS 1 OVER THE INTERNET - NO ACCOUNT NEEDED', 240, 42, 8, '#7f8bb5', 'center');
-  const back = () => txt('ESC = BACK', 240, 266, 8, '#5b6590', 'center');
+  txt('ONLINE PLAY', 240, 10, 16, '#ffd23f', 'center', '#7a1a1a');
+  const back = (t = 'ESC = BACK') => txt(t, 240, 266, 8, '#5b6590', 'center');
   if (L.st === 'menu') {
-    txt('H   HOST A GAME', 240, 100, 8, '#ffd23f', 'center'); txt('GET A ROOM CODE TO SHARE', 240, 111, 8, '#7f8bb5', 'center');
-    txt('J   JOIN A GAME', 240, 128, 8, '#8fd3ff', 'center'); txt('TYPE YOUR FRIEND\'S CODE', 240, 139, 8, '#7f8bb5', 'center');
-    txt('YOUR FIGHTER: ' + CH[myPick()].name, 240, 180, 8, CH[myPick()].col, 'center');
-    txt('CHANGE IT ON THE FIGHTER TAB FIRST', 240, 192, 8, '#5b6590', 'center');
-    txt('HOST PLAYS RED - GUEST PLAYS BLUE', 240, 214, 8, '#b8c4ee', 'center');
-    if (L.msg) txt(L.msg, 240, 236, 8, '#ff5a5f', 'center');
+    txt('1V1, 2V2 OR 3V3 OVER THE INTERNET - UP TO 6 PLAYERS', 240, 36, 8, '#7f8bb5', 'center');
+    txt('H   HOST A GAME', 240, 94, 8, '#ffd23f', 'center'); txt('GET A ROOM CODE AND PICK 1V1 / 2V2 / 3V3', 240, 106, 8, '#7f8bb5', 'center');
+    txt('J   JOIN A GAME', 240, 128, 8, '#8fd3ff', 'center'); txt('TYPE YOUR FRIEND\'S ROOM CODE', 240, 140, 8, '#7f8bb5', 'center');
+    txt('F   FRIENDS & SAVED ROOMS', 240, 162, 8, '#7be08a', 'center'); txt('SAVED CODES: ' + FRIENDS.length + ' - ONE-CLICK JOIN', 240, 174, 8, '#7f8bb5', 'center');
+    txt('YOUR FIGHTER: ' + CH[myPick()].name, 240, 204, 8, CH[myPick()].col, 'center');
+    txt('CHANGE IT ON THE FIGHTER TAB FIRST', 240, 216, 8, '#5b6590', 'center');
+    if (L.msg) txt(L.msg, 240, 238, 8, '#ff5a5f', 'center');
     back();
   } else if (L.st === 'hosting') {
-    txt('ROOM CODE', 240, 76, 8, '#8fd3ff', 'center');
-    txt(L.code || '.....', 240, 94, 32, '#ffffff', 'center', '#1b4b8a');
-    txt(L.msg || '', 240, 140, 8, blink ? '#ffd23f' : '#ffffff', 'center');
-    txt('SEND THIS CODE TO YOUR FRIEND - THEY PRESS', 240, 176, 8, '#b8c4ee', 'center');
-    txt('O ON THE TITLE SCREEN, THEN J TO JOIN', 240, 188, 8, '#b8c4ee', 'center');
-    back();
+    txt('ROOM CODE', 120, 38, 8, '#8fd3ff', 'center');
+    txt(L.code || '.....', 120, 50, 24, '#ffffff', 'center', '#1b4b8a');
+    txt('MODE', 360, 38, 8, '#8fd3ff', 'center');
+    MODES.forEach((n, i) => {                                                              // 1V1 / 2V2 / 3V3 selector
+      const bx = 262 + i * 62, sel = NET.mode === n;
+      ctx.fillStyle = '#0b0d1a'; ctx.fillRect(bx - 2, 48, 60, 28);
+      ctx.fillStyle = sel ? '#ffd23f' : '#3a4175'; ctx.fillRect(bx, 50, 56, 24);
+      txt(modeName(n), bx + 28, 57, 8, sel ? '#14182b' : '#e4f7ff', 'center', sel ? null : '#14182b');
+    });
+    drawRoster(88, lobbySlots());
+    const humans = NET.peers.filter(r => r.slot >= 0).length + 1;
+    txt(L.msg || (L.code ? humans + ' OF ' + NET.mode + ' PLAYERS IN - SHARE THE CODE' : 'CREATING ROOM...'), 240, 194, 8, L.msg ? '#ff5a5f' : '#b8c4ee', 'center');
+    ctx.fillStyle = blink ? '#ffd23f' : '#c9a227'; ctx.fillRect(110, 206, 260, 18);
+    txt('SPACE = START MATCH', 240, 211, 8, '#14182b', 'center', null);
+    txt('EMPTY SLOTS BECOME CPU BOTS (' + DIFF[S.level].name + ' - L)', 240, 232, 8, '#7f8bb5', 'center');
+    txt('KEYS 1 2 3 OR LEFT/RIGHT CHANGE THE MODE', 240, 244, 8, '#5b6590', 'center');
+    back('ESC = CLOSE ROOM');
   } else if (L.st === 'joining' || L.st === 'connecting') {
-    txt('ENTER ROOM CODE', 240, 70, 8, '#8fd3ff', 'center');
-    for (let i = 0; i < 5; i++) {
-      const x = 240 - 110 + i * 44;
-      ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x, 92, 40, 46);
-      ctx.fillStyle = i === L.code.length && L.st === 'joining' ? '#ffd23f' : '#3a4175'; ctx.fillRect(x + 2, 94, 36, 42);
-      ctx.fillStyle = '#14182b'; ctx.fillRect(x + 4, 96, 32, 38);
-      if (L.code[i]) txt(L.code[i], x + 20, 104, 24, '#ffffff', 'center');
-    }
+    txt('ENTER ROOM CODE', 240, 52, 8, '#8fd3ff', 'center');
+    drawCodeBoxes(L.code, 76, L.st === 'joining');
     if (L.st === 'joining') {
-      txt('ENTER = JOIN    CTRL+V = PASTE', 240, 156, 8, blink ? '#ffd23f' : '#ffffff', 'center');
-      txt(L.msg || '', 240, 184, 8, '#ff5a5f', 'center');
-    } else txt(L.msg, 240, 160, 8, blink ? '#ffd23f' : '#ffffff', 'center');
+      txt('ENTER = JOIN    CTRL+V = PASTE', 240, 138, 8, blink ? '#ffd23f' : '#ffffff', 'center');
+      txt(L.msg || '', 240, 166, 8, '#ff5a5f', 'center');
+    } else txt(L.msg, 240, 142, 8, blink ? '#ffd23f' : '#ffffff', 'center');
     back();
   } else if (L.st === 'ready') {
-    const card = (id, x) => {
-      const mine = id === NET.me, ch = CH[mine ? myPick() : NET.peerChar], team = id ? '#2a6fdb' : '#d62839', light = id ? '#8fd3ff' : '#ff7a59';
-      ctx.fillStyle = team; ctx.fillRect(x, 64, 200, 100); ctx.fillStyle = '#14182b'; ctx.fillRect(x + 2, 66, 196, 96);
-      txt((id ? 'GUEST - BLUE' : 'HOST - RED') + (mine ? ' (YOU)' : ''), x + 100, 72, 8, light, 'center');
-      blit(SPR[CH.indexOf(ch)][id][Math.abs(Math.floor(S.t * 3)) % 2], x + 76, 90, id === 1, 3);
-      txt(ch.name, x + 100, 138, 8, ch.col, 'center');
-      txt(ch.spellName, x + 100, 150, 8, '#e4f7ff', 'center');
-    };
-    card(0, 30); card(1, 250);
-    txt('VS', 240, 100, 16, '#ffd23f', 'center');
-    txt('CONNECTED!', 240, 184, 8, '#7be08a', 'center');
-    if (NET.role === 'host') {
-      ctx.fillStyle = blink ? '#ffd23f' : '#c9a227'; ctx.fillRect(130, 212, 220, 24);
-      txt('SPACE = START MATCH', 240, 220, 8, '#14182b', 'center', null);
-    } else txt('WAITING FOR THE HOST TO START...', 240, 220, 8, blink ? '#ffd23f' : '#ffffff', 'center');
-    txt('ESC = LEAVE', 240, 266, 8, '#5b6590', 'center');
+    const info = lobbySlots();
+    txt('CONNECTED TO ROOM ' + NET.joinCode, 240, 38, 8, '#7be08a', 'center');
+    txt('YOU ARE ' + slotLabel(NET.me) + ' - ' + (NET.me % 2 ? 'BLUE' : 'RED') + ' TEAM - ' + modeName(info.n), 240, 50, 8, SLOT_COL[NET.me], 'center');
+    drawRoster(76, info);
+    txt('WAITING FOR THE HOST TO START...', 240, 182, 8, blink ? '#ffd23f' : '#ffffff', 'center');
+    ctx.fillStyle = '#2b3158'; ctx.fillRect(100, 226, 280, 20);
+    txt(L.saved ? 'SAVED AS ' + L.saved : 'S = SAVE THIS ROOM TO FRIENDS', 240, 232, 8, L.saved ? '#7be08a' : '#e4f7ff', 'center');
+    back('ESC = LEAVE');
+  } else if (L.st === 'friends') {
+    txt('FRIENDS & SAVED ROOMS', 240, 34, 8, '#8fd3ff', 'center');
+    if (!FRIENDS.length) {
+      txt('NOTHING SAVED YET', 240, 100, 8, '#7f8bb5', 'center');
+      txt('PRESS N TO ADD A FRIEND\'S ROOM CODE', 240, 118, 8, '#7f8bb5', 'center');
+      txt('OR JOIN A ROOM AND PRESS S', 240, 132, 8, '#7f8bb5', 'center');
+    }
+    const top = clamp(L.scroll || 0, 0, Math.max(0, FRIENDS.length - 7));
+    for (let i = 0; i < 7; i++) {
+      const f = FRIENDS[top + i]; if (!f) break;
+      const y = 56 + i * 24, sel = top + i === L.sel;
+      ctx.fillStyle = sel ? '#2b3158' : '#181d36'; ctx.fillRect(20, y, 440, 21);
+      if (sel) { ctx.fillStyle = '#ffd23f'; ctx.fillRect(20, y, 3, 21); }
+      txt(f.n, 32, y + 7, 8, '#ffffff'); txt(f.c, 230, y + 7, 8, '#ffd23f');
+      ctx.fillStyle = sel ? '#ffd23f' : '#3a4175'; ctx.fillRect(372, y + 2, 62, 17);
+      txt('JOIN', 403, y + 7, 8, sel ? '#14182b' : '#e4f7ff', 'center', null);
+      ctx.fillStyle = '#5a2330'; ctx.fillRect(440, y + 2, 16, 17);
+      txt('X', 448, y + 7, 8, '#ff5a5f', 'center', null);
+    }
+    if (FRIENDS.length > 7) txt((top + 1) + '-' + Math.min(FRIENDS.length, top + 7) + ' OF ' + FRIENDS.length, 466, 226, 8, '#5b6590', 'right');
+    ctx.fillStyle = '#2b3158'; ctx.fillRect(20, 240, 150, 18); txt('N = ADD NEW', 95, 245, 8, '#e4f7ff', 'center');
+    txt('ENTER = JOIN   X = DELETE', 466, 245, 8, '#7f8bb5', 'right');
+    txt(L.msg || '', 240, 226, 8, '#7be08a', 'center');
+    back();
+  } else if (L.st === 'fname') {
+    txt('NEW FRIEND OR SAVED ROOM', 240, 44, 8, '#8fd3ff', 'center');
+    txt('NICKNAME', 240, 74, 8, '#b8c4ee', 'center');
+    ctx.fillStyle = '#0b0d1a'; ctx.fillRect(110, 90, 260, 28); ctx.fillStyle = '#ffd23f'; ctx.fillRect(112, 92, 256, 24); ctx.fillStyle = '#14182b'; ctx.fillRect(114, 94, 252, 20);
+    txt(L.nick + (blink ? '_' : ''), 240, 100, 8, '#ffffff', 'center');
+    txt('LETTERS, NUMBERS, SPACE AND - (MAX 10)', 240, 134, 8, '#5b6590', 'center');
+    txt('ENTER = NEXT   ESC = CANCEL', 240, 156, 8, blink ? '#ffd23f' : '#ffffff', 'center');
+  } else if (L.st === 'fcode') {
+    txt('ROOM CODE FOR ' + L.nick, 240, 52, 8, '#8fd3ff', 'center');
+    drawCodeBoxes(L.code, 76, true);
+    txt('ENTER = SAVE   CTRL+V = PASTE', 240, 138, 8, blink ? '#ffd23f' : '#ffffff', 'center');
+    txt(L.msg || '', 240, 166, 8, '#ff5a5f', 'center');
+    txt('ESC = CANCEL', 240, 266, 8, '#5b6590', 'center');
   }
 }
-
 /* ---------- per-frame update ---------- */
 function auraParticle(p) {
   const hx = p.x + p.face * 0.5, hy = p.y - 9;
@@ -2118,7 +2374,7 @@ function liveUpdate(dt) {
     if (q.t <= 0) { puddles.splice(i, 1); continue; }
     if (Math.random() < dt * 5) spawn(q.x + rnd(-q.r, q.r) * 0.7, q.y + rnd(-q.r, q.r) * 0.5, 0, rnd(-14, -6), 0.7, 2, ['#d2ffd8', '#7be08a']);
     for (const p of P) {
-      if (p.id === q.owner) continue;
+      if (p.team === q.owner) continue;
       const ex = (p.x - q.x) / q.r, ey = (p.y - q.y) / (q.r * 0.75);
       if (ex * ex + ey * ey < 1.15) {
         if (p.oil <= 0) { p.slipDir = Math.random() < 0.5 ? -1 : 1; addText('SLIP!', p.x, p.y - 16, '#7be08a'); sfx('slip'); stat(q.owner, 'slips'); }
@@ -2168,7 +2424,7 @@ function updateCore(dt) {
       if (!S.ot) S.time -= dt; else S.otT += dt;
       P.forEach(p => {
         p.mana = Math.min(1, p.mana + dt / MANA_TIME * regenMul(CH[p.char]));
-        if (p.mana >= 0.999 && !p.wasFull) { p.wasFull = true; if (isMe(p.id)) sfx('ready'); else if (NET.role === 'host') NET.ev.push(['s', 'ready']); }
+        if (p.mana >= 0.999 && !p.wasFull) { p.wasFull = true; if (isMe(p.id)) sfx('ready'); else if (NET.role === 'host') NET.ev.push(['r', p.id]); }
       });
       if (!S.ot && S.time <= 0) {
         S.time = 0; sfx('whistle');
@@ -2211,7 +2467,7 @@ function drawStick(p) {
 
   // butt-end knob in team colour
   ctx.fillStyle = OUT; ctx.fillRect(hx - 2, hy - 2, 4, 3);
-  ctx.fillStyle = p.id ? '#8fd3ff' : '#ff7a59'; ctx.fillRect(hx - 1, hy - 1, 2, 1);
+  ctx.fillStyle = p.team ? '#8fd3ff' : '#ff7a59'; ctx.fillRect(hx - 1, hy - 1, 2, 1);
 }
 function drawShield(p) {
   if (p.shield <= 0) return;
@@ -2227,13 +2483,23 @@ function drawShield(p) {
     ctx.fillRect(sx - 1, sy, 3, 1); ctx.fillRect(sx, sy - 1, 1, 3);
   }
 }
+function drawTag(p, x, y) {
+  const col = SLOT_COL[p.id], me = NET.role ? p.id === NET.me : !p.cpu;
+  ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x - 7, y + 8, 15, 4);
+  ctx.fillStyle = col; ctx.fillRect(x - 6, y + 9, 13, 2);                       // colour bar under the skates
+  txt(slotLabel(p.id), x, y - 29, 8, p.cpu ? '#9aa3c9' : col, 'center');         // R1 / B2 ... (dimmer for bots)
+  if (me) {                                                                       // little white arrow over your own skater
+    ctx.fillStyle = '#14182b'; ctx.fillRect(x - 3, y - 20, 7, 2); ctx.fillRect(x - 2, y - 18, 5, 2); ctx.fillRect(x - 1, y - 16, 3, 1);
+    ctx.fillStyle = '#ffffff'; ctx.fillRect(x - 2, y - 20, 5, 1); ctx.fillRect(x - 1, y - 19, 3, 1); ctx.fillRect(x, y - 18, 1, 1);
+  }
+}
 function drawPlayer(p) {
   const x = Math.round(p.x), y = Math.round(p.y);
   ctx.fillStyle = 'rgba(20,24,43,.28)'; ctx.fillRect(x - 5, y + 6, 11, 3);
   const spdNow = Math.hypot(p.vx, p.vy);
   const moving = spdNow > 14;
   const frame = moving && (Math.abs(Math.floor(p.anim)) % 2 === 1) ? 1 : 0;
-  const spr = SPR[p.char][p.id][frame];
+  const spr = SPR[p.char][p.team][frame];
   if (p.char === 2 && spdNow > 60) {                    // ninja after-images
     ctx.globalAlpha = 0.28; blit(spr, Math.round(x - 5 - p.vx * 0.06), Math.round(y - 9 - p.vy * 0.06), p.face < 0);
     ctx.globalAlpha = 0.14; blit(spr, Math.round(x - 5 - p.vx * 0.12), Math.round(y - 9 - p.vy * 0.12), p.face < 0);
@@ -2252,6 +2518,7 @@ function drawPlayer(p) {
   if (!behind) drawStick(p);
   ctx.globalAlpha = 1;
   drawShield(p);
+  if (P.length > 2) drawTag(p, x, y);                    // 2v2 / 3v3: show who is who
   if (p.charge > 0.04) {                                // shot power meter
     const w = 14, x0 = x - 7, y0 = y - 17, full = p.charge >= 0.999;
     ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x0 - 1, y0 - 1, w + 2, 5);
@@ -2334,7 +2601,7 @@ function drawPuck() {
     pxDisc(ctx, x, y, 3, '#ffb100');
     pxDisc(ctx, x, y, 1, '#fff3a0');
   } else {
-    if (puck.carrier >= 0) { ctx.fillStyle = puck.carrier ? '#8fd3ff' : '#ff7a59'; ctx.fillRect(x - 4, y + 4, 9, 1); ctx.fillRect(x - 4, y - 5, 9, 1); }
+    if (puck.carrier >= 0 && P[puck.carrier]) { ctx.fillStyle = P[puck.carrier].team ? '#8fd3ff' : '#ff7a59'; ctx.fillRect(x - 4, y + 4, 9, 1); ctx.fillRect(x - 4, y - 5, 9, 1); }
     ctx.fillStyle = 'rgba(20,24,43,.3)'; ctx.fillRect(x - 3, y + 3, 7, 2);
     ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x - 3, y - 3, 7, 6);
     ctx.fillStyle = '#2b2f4a'; ctx.fillRect(x - 2, y - 2, 5, 4);
@@ -2355,7 +2622,7 @@ function drawParticles() {
 function manaBar(p, x, y, cols) {
   const full = p.mana >= 0.999;
   ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x, y, 124, 12);
-  ctx.fillStyle = p.id ? '#2a6fdb' : '#d62839';
+  ctx.fillStyle = p.team ? '#2a6fdb' : '#d62839';
   ctx.fillRect(x, y, 124, 2); ctx.fillRect(x, y + 10, 124, 2); ctx.fillRect(x, y, 2, 12); ctx.fillRect(x + 122, y, 2, 12);
   const n = p.mana * 10, flash = full && Math.floor(S.t * 8) % 2;
   for (let i = 0; i < 10; i++) {
@@ -2382,10 +2649,11 @@ function drawHUD() {
   ctx.fillStyle = '#d62839'; ctx.fillRect(0, 30, 240, 2);
   ctx.fillStyle = '#2a6fdb'; ctx.fillRect(240, 30, 240, 2);
 
-  txt(CH[P[0].char].short, 8, 4, 8, '#ff7a59');
-  txt(CH[P[1].char].short, 472, 4, 8, '#8fd3ff', 'right');
-  manaBar(P[0], 8, 16, CH[P[0].char].mana);
-  manaBar(P[1], 348, 16, CH[P[1].char].mana);
+  const hL = leadOf(0), hR = leadOf(1);                    // the HUD shows you (or the first skater) of each team
+  txt((P.length > 2 ? slotLabel(hL.id) + ' ' : '') + CH[hL.char].short, 8, 4, 8, '#ff7a59');
+  txt((P.length > 2 ? slotLabel(hR.id) + ' ' : '') + CH[hR.char].short, 472, 4, 8, '#8fd3ff', 'right');
+  manaBar(hL, 8, 16, CH[hL.char].mana);
+  manaBar(hR, 348, 16, CH[hR.char].mana);
 
   const blink = Math.floor(S.t * 4) % 2;
   if (S.mode === 'play' || S.mode === 'paused') {
@@ -2393,7 +2661,7 @@ function drawHUD() {
       if (p.noPuck > 0) txt('NEED PUCK', x, 4, 8, '#ff5a5f', al);
       else if (p.mana >= 0.999) txt('READY!', x, 4, 8, blink ? '#ffd23f' : '#ffffff', al);
     };
-    st(P[0], 132, 'right'); st(P[1], 348, 'left');
+    st(hL, 132, 'right'); st(hR, 348, 'left');
   }
 
   // score boxes
@@ -2429,8 +2697,9 @@ function pips(x, y, n, col) {
     if (i < n) { ctx.fillStyle = 'rgba(255,255,255,.35)'; ctx.fillRect(x + i * 14 + 1, y + 1, 10, 1); }
   }
 }
-function roleLabel(id) {
-  if (NET.role) return id === NET.me ? 'YOU' : 'OPPONENT';
+function roleLabel(id) {                                   // id = team
+  if (NET.role && P.length > 2) return (id ? 'BLUE' : 'RED') + ' TEAM' + (P[NET.me] && P[NET.me].team === id ? ' (YOU)' : '');
+  if (NET.role) return P[NET.me] && P[NET.me].team === id ? 'YOU' : 'OPPONENT';
   if (S.cpu) return id === S.cpuId ? 'CPU - ' + DIFF[S.level].name : 'YOU';
   return 'PLAYER ' + (id + 1);
 }
@@ -2647,7 +2916,7 @@ function drawIntro() {
 
   const off = (1 - easeOut(t / 0.5)) * 170;
   const side = id => {
-    const c = CH[S.chars[id]];
+    const c = CH[leadOf(id).char];
     const cx = id ? 360 + off : 120 - off;
     const team = id ? '#2a6fdb' : '#d62839', light = id ? '#8fd3ff' : '#ff7a59';
     txt(roleLabel(id), cx, 25, 8, light, 'center');
@@ -2655,14 +2924,17 @@ function drawIntro() {
     ctx.fillStyle = '#0b0d1a'; ctx.fillRect(cx - 56, 38, 112, 118);
     pxEllipse(ctx, Math.round(cx), 148, 34, 4, '#1b2040');
     const bob = Math.round(Math.sin(S.t * 4 + id) * 2);
-    blit(SPR[S.chars[id]][id][Math.abs(Math.floor(S.t * 3)) % 2], Math.round(cx - 44), 40 + bob, id === 1, 8);
+    blit(SPR[leadOf(id).char][id][Math.abs(Math.floor(S.t * 3)) % 2], Math.round(cx - 44), 40 + bob, id === 1, 8);
     if (t > 0.45) {
       txt(c.name, cx, 166, 16, c.col, 'center');
       txt('SPECIAL: ' + c.spellName, cx, 188, 8, '#e4f7ff', 'center');
       txt(c.l1, cx, 202, 8, '#b8c4ee', 'center');
       txt(c.l2, cx, 214, 8, '#b8c4ee', 'center');
-      txt('SPEED', cx - 86, 232, 8, '#b8c4ee'); pips(cx - 30, 231, c.spdPips, light);
-      txt('CHECK', cx - 86, 246, 8, '#b8c4ee'); pips(cx - 30, 245, c.chkPips, light);
+      if (P.length > 2) txt(teamOf(id).map(q => CH[q.char].short.slice(0, 5)).join(' + '), cx, 236, 8, light, 'center');      // whole squad
+      else {
+        txt('SPEED', cx - 86, 232, 8, '#b8c4ee'); pips(cx - 30, 231, c.spdPips, light);
+        txt('CHECK', cx - 86, 246, 8, '#b8c4ee'); pips(cx - 30, 245, c.chkPips, light);
+      }
     }
   };
   side(0); side(1);
@@ -2724,12 +2996,12 @@ function drawResults() {
 
   // final score
   const sb = (id, x) => {
-    const c = CH[S.chars[id]], team = id ? '#2a6fdb' : '#d62839';
-    const tag = NET.role ? (id === NET.me ? 'YOU' : 'OPP') : S.cpu ? (id === S.cpuId ? 'CPU' : 'YOU') : 'P' + (id + 1);
+    const c = CH[leadOf(id).char], team = id ? '#2a6fdb' : '#d62839';
+    const tag = NET.role ? (P.length > 2 ? (id ? 'BLUE' : 'RED') : (P[NET.me] && P[NET.me].team === id ? 'YOU' : 'OPP')) : S.cpu ? (id === S.cpuId ? 'CPU' : 'YOU') : 'P' + (id + 1);
     ctx.fillStyle = win === id ? '#ffd23f' : '#0b0d1a'; ctx.fillRect(x - 3, 55, 174, 60);
     ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x - 1, 57, 170, 56);
     ctx.fillStyle = team; ctx.fillRect(x, 58, 168, 54);
-    blit(SPR[S.chars[id]][id][0], x + 8, 64, id === 1, 3);
+    blit(SPR[leadOf(id).char][id][0], x + 8, 64, id === 1, 3);
     txt(String(S.score[id]), x + 118, 72, 32, '#ffffff', 'center', '#14182b');
     txt(tag + ' ' + c.name, x + 84, 120, 8, '#e4f7ff', 'center');
   };
@@ -2838,7 +3110,7 @@ function render() {
   ctx.drawImage(rinkLayer, 0, 0);
   puddles.forEach(drawPuddle);
   walls.forEach(drawWall);
-  [G[0], G[1], P[0], P[1]].sort((a, b) => a.y - b.y).forEach(e => e.kind === 'g' ? drawGoalie(e) : drawPlayer(e));
+  [...G, ...P].sort((a, b) => a.y - b.y).forEach(e => e.kind === 'g' ? drawGoalie(e) : drawPlayer(e));
   if (S.mode !== 'title' && S.mode !== 'lobby') drawPuck();
   decoys.forEach(drawDecoy);
   drawParticles();
