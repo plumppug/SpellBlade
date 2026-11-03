@@ -646,6 +646,7 @@ function startGame() {
     const ro = NET.role === 'host' && NET.roster[p.id];                  // online: the lobby decided who is human and who is a bot
     p.cpu = ro ? ro.cpu : (S.cpu && p.id === S.cpuId);
     p.char = ro ? ro.char : S.chars[p.id];
+    p.name = ro ? ro.name : '';
     p.spd = (p.cpu ? DIFF[S.level].spd : 1) * CH[p.char].spd;
     p.aiIx = 0; p.aiIy = 0; p.aiT = 0; p.aiCd = 0; p.aiFireT = 0; p.stuckT = 0;
     p.aiAimY = CY; p.aiTx = p.x; p.aiTy = p.y;
@@ -659,7 +660,7 @@ function startGame() {
     S.remReq = false; NET.nextSend = 0; NET.snapN = 0; NET.mid++;
     NET.peers.forEach(r => { r.inp.ack = 0; r.lastRx = performance.now(); });
     // each client gets the full roster plus *its own* slot number ("you")
-    for (const r of NET.peers) if (r.slot >= 0) netTo(r, { t: 'start', mid: NET.mid, n: P.length, you: r.slot, slots: NET.roster.map(q => ({ char: q.char, cpu: q.cpu })) });
+    for (const r of NET.peers) if (r.slot >= 0) netTo(r, { t: 'start', mid: NET.mid, n: P.length, you: r.slot, slots: NET.roster.map(q => ({ char: q.char, cpu: q.cpu, name: q.name })) });
   }
 }
 function skipIntro() { S.mode = 'countdown'; S.cd = 2.4; sfx('tick'); }
@@ -778,6 +779,7 @@ function onPress(c) {
     if (c === 'Escape') { if (S.tab !== 0) setTab(0); return; }
     if (c === 'Space' || c === 'Enter') { startGame(); return; }
     if (c === 'KeyO' && S.tab === 0) { openLobby(); return; }
+    if (c === 'KeyN' && S.tab === 0) { openLobby(); nameEdit(); return; }          // set your username from the title screen
     if (c === 'Digit1' || c === 'Numpad1') { S.cpu = true; startGame(); return; }
     if (c === 'Digit2' || c === 'Numpad2') { S.cpu = false; startGame(); return; }
     if (S.tab === 1) { fighterPress(c); return; }
@@ -1709,7 +1711,18 @@ function netTo(r, m) { try { if (r.conn.open) r.conn.send(m); } catch (e) {} }
 const MODES = [2, 4, 6];                                              // players per match: 1v1, 2v2, 3v3
 const modeName = n => (n / 2) + 'V' + (n / 2);
 const JOIN_ORDER = [1, 2, 3, 4, 5, 0];                                // joiners fill Blue1, Red2, Blue2, Red3, Blue3 -> teams stay balanced (slot 0 only if the host moved away)
+// USERNAME: whatever you like (A-Z, 0-9, space, dash; up to 10 characters). Saved in the browser; change it from the title screen (N),
+// the online menu or inside a room - everyone in the room sees the new name right away.
+const NAME_KEY = 'spellblade_name_v1';
+let NAME = 'PLAYER';
 const cleanName = v => String(v || 'PLAYER').toUpperCase().replace(/[^A-Z0-9 \-]/g, '').slice(0, 10) || 'PLAYER';
+try { const d = localStorage.getItem(NAME_KEY); if (d) NAME = cleanName(d); } catch (e) {}
+function setName(v) {
+  NAME = cleanName(v);
+  try { localStorage.setItem(NAME_KEY, NAME); } catch (e) {}
+  if (NET.role === 'guest' && NET.conn) netSend({ t: 'name', name: NAME });         // tell the host so the whole room sees it
+  else if (NET.role === 'host') lobbySync();
+}
 function myPick() { return S.cpu ? S.chars[humanId()] : S.chars[0]; }
 function openLobby() { sanitizeChars(); S.mode = 'lobby'; S.lob = { st: 'menu', code: '', msg: '' }; sfx('tick'); }
 function leaveLobby() { netClose(); S.lob = null; S.mode = 'title'; S.tab = 0; sfx('tick'); }
@@ -1735,7 +1748,7 @@ function netLost(msg) {
 // ---- GUEST: one connection to the host ---------------------------------------------------------------------------------------------
 function netAttach(c) {
   NET.conn = c;
-  c.on('open', () => { netSend({ t: 'hello', char: myPick(), name: 'PLAYER' }); NET.lastRx = performance.now(); });
+  c.on('open', () => { netSend({ t: 'hello', char: myPick(), name: NAME }); NET.lastRx = performance.now(); });
   c.on('data', m => { NET.lastRx = performance.now(); guestData(m); });
   c.on('close', () => { if (NET.conn === c) netLost('HOST LEFT'); });
   c.on('error', () => { if (NET.conn === c) netLost('CONNECTION ERROR'); });
@@ -1830,6 +1843,7 @@ function hostData(r, m) {                                             // a messa
     case 'sp': if (NET.inMatch && S.mode === 'play' && P[r.slot]) castSpell(P[r.slot]); break;
     case 'sk': if (NET.inMatch && P[r.slot]) useSkill(P[r.slot]); break;
     case 'rem': if (S.mode === 'over') { S.remReq = true; sfx('ready'); } break;
+    case 'name': if (!NET.inMatch) { r.name = cleanName(m.name); lobbySync(); } break;           // a guest renamed themselves
     case 'bye': peerGone(r); break;
   }
 }
@@ -1857,7 +1871,7 @@ function lobbySlots() {
     const slots = [];
     for (let i = 0; i < NET.mode; i++) {
       const r = NET.peers.find(q => q.slot === i);
-      slots.push(i === NET.me ? { h: 1, n: 'HOST', c: myPick() } : r ? { h: 1, n: r.name, c: r.char } : { h: 0 });
+      slots.push(i === NET.me ? { h: 1, n: NAME, c: myPick(), host: 1 } : r ? { h: 1, n: r.name, c: r.char } : { h: 0 });
     }
     return { n: NET.mode, slots };
   }
@@ -1895,8 +1909,8 @@ function lobbyStartMatch() {                                          // host: S
   // every slot: a connected human gets their own controls (p.net), anyone missing becomes a bot with a random fighter
   NET.roster = P.map((p, i) => {
     const r = NET.peers.find(q => q.slot === i);
-    if (i === NET.me) return { char: myPick(), cpu: false };                 // the host's own skater (wherever the host was moved to)
-    return r ? { char: r.char, cpu: false } : { char: Math.floor(Math.random() * CH.length), cpu: true };
+    if (i === NET.me) return { char: myPick(), cpu: false, name: NAME };      // the host's own skater (wherever the host was moved to)
+    return r ? { char: r.char, cpu: false, name: r.name } : { char: Math.floor(Math.random() * CH.length), cpu: true, name: 'CPU' };
   });
   P.forEach((p, i) => { const r = NET.peers.find(q => q.slot === i); p.net = r ? r.inp : null; if (r) { r.inp.ix = r.inp.iy = 0; r.inp.sh = false; } });
   NET.inMatch = true;
@@ -1915,7 +1929,7 @@ function guestStart(m) {                                              // the hos
   S.cpu = false; S.score = [0, 0]; S.time = MATCH_TIME; S.ot = false; S.winner = -1; S.xpRes = null; S.resSel = 0;
   P.forEach((p, i) => {
     const sl = (m.slots && m.slots[i]) || {};
-    p.cpu = !!sl.cpu; p.net = null; p.char = clamp(num(sl.char) | 0, 0, CH.length - 1); p.spd = CH[p.char].spd;
+    p.cpu = !!sl.cpu; p.net = null; p.char = clamp(num(sl.char) | 0, 0, CH.length - 1); p.spd = CH[p.char].spd; p.name = sl.cpu ? 'CPU' : cleanName(sl.name);
   });
   particles.length = 0; texts.length = 0; resetPositions();
   P.forEach(p => { p.rx = p.x; p.ry = p.y; p.rbx = p.bx; p.rby = p.by; p.ex = p.ey = 0; });
@@ -2144,20 +2158,31 @@ function typed(c, codeOnly) {                                         // keyboar
   return (codeOnly && !NET_ALPHA.includes(ch)) ? '' : ch;
 }
 function joinFriend(f) { S.lob = { st: 'joining', code: f.c, msg: '' }; netJoin(); }      // quick-connect: straight into their room
-function addFriendFlow(prefillCode, ret) { S.lob = { st: 'fname', nick: '', code: prefillCode || '', msg: '', ret: ret || 'friends' }; }
+function addFriendFlow(prefillCode, ret, nick) { S.lob = { st: 'fname', nick: nick && nick !== 'PLAYER' ? cleanName(nick) : '', code: prefillCode || '', msg: '', ret: ret || 'friends' }; }
+function nameEdit() { const prev = S.lob; S.lob = { st: 'name', nick: NAME, prev, msg: '' }; sfx('tick'); }   // edit my username; remembers the screen to return to
 function lobbyPress(c) {
   const L = S.lob; if (!L) return;
   if (c === 'Escape') {
     if (L.st === 'menu' || L.st === 'hosting' || L.st === 'connecting') leaveLobby();
+    else if (L.st === 'name') { S.lob = L.prev || { st: 'menu', code: '', msg: '' }; sfx('tick'); }
     else if (L.st === 'fname' || L.st === 'fcode') { if (L.ret === 'ready') { L.st = 'ready'; } else { S.lob = { st: 'friends', sel: 0, scroll: 0, msg: '' }; } sfx('tick'); }
     else if (L.st === 'ready') leaveLobby();
     else { S.lob = { st: 'menu', code: '', msg: '' }; sfx('tick'); }                 // joining / friends -> back to the lobby menu
+    return;
+  }
+  if (L.st === 'name') {
+    if (c === 'Enter') {
+      if (!L.nick.trim()) { sfx('deny'); return; }
+      setName(L.nick); S.lob = L.prev || { st: 'menu', code: '', msg: '' }; S.lob.msg = S.lob.st === 'menu' ? 'NAME SAVED: ' + NAME : S.lob.msg; sfx('ach');
+    } else if (c === 'Backspace') L.nick = L.nick.slice(0, -1);
+    else { const ch = typed(c, false); if (ch && L.nick.length < 10) L.nick += ch; }
     return;
   }
   if (L.st === 'menu') {
     if (c === 'KeyH') netHost();
     else if (c === 'KeyJ') { S.lob = { st: 'joining', code: '', msg: '' }; sfx('tick'); }
     else if (c === 'KeyF') { S.lob = { st: 'friends', sel: 0, scroll: 0, msg: '' }; sfx('tick'); }
+    else if (c === 'KeyN') nameEdit();
   } else if (L.st === 'joining') {
     if (c === 'Enter') netJoin();
     else if (c === 'Backspace') { L.code = L.code.slice(0, -1); L.msg = ''; }
@@ -2169,13 +2194,15 @@ function lobbyPress(c) {
     else if (c === 'Digit3' || c === 'Numpad3') setLobbyMode(6);
     else if (c === 'ArrowLeft' || c === 'ArrowRight') setLobbyMode(MODES[clamp(MODES.indexOf(NET.mode) + (c === 'ArrowRight' ? 1 : -1), 0, 2)]);
     else if (c === 'KeyL') { S.level = (S.level + 1) % 3; sfx('tick'); }                // difficulty of the bots
+    else if (c === 'KeyN') nameEdit();
     else if (c === 'Tab') { L.cur = ((L.cur == null ? -1 : L.cur) + 1) % NET.mode; sfx('tick'); }       // pick a slot with the keyboard...
     else if (c === 'KeyT') {                                                            // ...and send it to the other team
       if (L.cur == null || L.cur < 0) { L.msg = 'PICK A PLAYER FIRST (CLICK OR TAB)'; sfx('deny'); }
       else { L.cur = moveToOtherTeam(L.cur); L.msg = ''; }
     }
   } else if (L.st === 'ready') {
-    if (c === 'KeyS') addFriendFlow(NET.joinCode, 'ready');                              // save the room I'm in
+    if (c === 'KeyS') { const h = lobbySlots().slots.find(q => q && q.host); addFriendFlow(NET.joinCode, 'ready', h ? h.n : ''); }      // save the room I'm in (nickname pre-filled with the host's name)
+    else if (c === 'KeyN') nameEdit();
   } else if (L.st === 'friends') {
     if (c === 'ArrowUp') L.sel = Math.max(0, L.sel - 1);
     else if (c === 'ArrowDown') L.sel = Math.min(FRIENDS.length - 1, L.sel + 1);
@@ -2204,7 +2231,8 @@ function lobbyClick(x, y) {
   if (L.st === 'menu') {
     if (y >= 90 && y < 120) netHost();
     else if (y >= 124 && y < 154) { S.lob = { st: 'joining', code: '', msg: '' }; sfx('tick'); }
-    else if (y >= 158 && y < 188) lobbyPress('KeyF');
+    else if (y >= 158 && y < 186) lobbyPress('KeyF');
+    else if (y >= 188 && y < 204) nameEdit();
   } else if (L.st === 'hosting') {
     if (y >= 262) { leaveLobby(); return; }
     if (y >= 50 && y < 78) { for (let i = 0; i < 3; i++) if (x >= 262 + i * 62 && x < 262 + i * 62 + 56) setLobbyMode(MODES[i]); }
@@ -2228,6 +2256,7 @@ function lobbyClick(x, y) {
       }
     }
   } else if (L.st === 'ready' && x >= 100 && x < 380 && y >= 226 && y < 246) lobbyPress('KeyS');
+  if ((L.st === 'hosting' || L.st === 'ready') && y < 24 && x >= 330) nameEdit();                      // the NAME tag in the corner
 }
 function drawCodeBoxes(code, y, active) {
   for (let i = 0; i < 5; i++) {
@@ -2251,7 +2280,7 @@ function drawRoster(y, info, cur = -1) {
       ctx.fillStyle = '#14182b'; ctx.fillRect(cx + 2, ry + 2, 206, 21);
       ctx.fillStyle = SLOT_COL[slot]; ctx.fillRect(cx + 4, ry + 4, 6, 17);
       const who = sl.h ? cleanName(sl.n) : 'CPU BOT';
-      txt(slotLabel(slot) + ' ' + who + (slot === NET.me ? ' (YOU)' : ''), cx + 16, ry + 4, 8, sl.h ? '#ffffff' : '#7f8bb5');
+      txt(slotLabel(slot) + ' ' + who + (slot === NET.me ? ' (YOU)' : sl.host ? ' (HOST)' : ''), cx + 16, ry + 4, 8, sl.h ? '#ffffff' : '#7f8bb5');
       const ch = CH[clamp(num(sl.c) | 0, 0, CH.length - 1)];
       if (sl.h) txt(ch.name, cx + 16, ry + 14, 8, ch.col); else txt('OPEN - BOT FILLS IN', cx + 16, ry + 14, 8, '#5b6590');
     }
@@ -2263,18 +2292,20 @@ function drawLobby() {
   const blink = Math.floor(S.t * 3) % 2;
   txt('ONLINE PLAY', 240, 10, 16, '#ffd23f', 'center', '#7a1a1a');
   const back = (t = 'ESC = BACK') => txt(t, 240, 266, 8, '#5b6590', 'center');
+  if (L.st === 'hosting' || L.st === 'ready') txt('NAME: ' + NAME + ' [N]', 470, 6, 8, '#ffa94d', 'right');      // change your name any time
   if (L.st === 'menu') {
     txt('1V1, 2V2 OR 3V3 OVER THE INTERNET - UP TO 6 PLAYERS', 240, 36, 8, '#7f8bb5', 'center');
     txt('H   HOST A GAME', 240, 94, 8, '#ffd23f', 'center'); txt('GET A ROOM CODE AND PICK 1V1 / 2V2 / 3V3', 240, 106, 8, '#7f8bb5', 'center');
     txt('J   JOIN A GAME', 240, 128, 8, '#8fd3ff', 'center'); txt('TYPE YOUR FRIEND\'S ROOM CODE', 240, 140, 8, '#7f8bb5', 'center');
     txt('F   FRIENDS & SAVED ROOMS', 240, 162, 8, '#7be08a', 'center'); txt('SAVED CODES: ' + FRIENDS.length + ' - ONE-CLICK JOIN', 240, 174, 8, '#7f8bb5', 'center');
-    txt('YOUR FIGHTER: ' + CH[myPick()].name, 240, 204, 8, CH[myPick()].col, 'center');
-    txt('CHANGE IT ON THE FIGHTER TAB FIRST', 240, 216, 8, '#5b6590', 'center');
-    if (L.msg) txt(L.msg, 240, 238, 8, '#ff5a5f', 'center');
+    txt('N   YOUR NAME: ' + NAME, 240, 192, 8, '#ffa94d', 'center');
+    txt('YOUR FIGHTER: ' + CH[myPick()].name, 240, 214, 8, CH[myPick()].col, 'center');
+    txt('CHANGE IT ON THE FIGHTER TAB FIRST', 240, 226, 8, '#5b6590', 'center');
+    if (L.msg) txt(L.msg, 240, 242, 8, L.msg.startsWith('NAME SAVED') ? '#7be08a' : '#ff5a5f', 'center');
     back();
   } else if (L.st === 'hosting') {
     txt('ROOM CODE', 120, 38, 8, '#8fd3ff', 'center');
-    txt(L.code || '.....', 120, 50, 24, '#ffffff', 'center', '#1b4b8a');
+    txt(NET.code || L.code || '.....', 120, 50, 24, '#ffffff', 'center', '#1b4b8a');
     txt('MODE', 360, 38, 8, '#8fd3ff', 'center');
     MODES.forEach((n, i) => {                                                              // 1V1 / 2V2 / 3V3 selector
       const bx = 262 + i * 62, sel = NET.mode === n;
@@ -2333,6 +2364,13 @@ function drawLobby() {
     txt('ENTER = JOIN   X = DELETE', 466, 245, 8, '#7f8bb5', 'right');
     txt(L.msg || '', 240, 226, 8, '#7be08a', 'center');
     back();
+  } else if (L.st === 'name') {
+    txt('YOUR USERNAME', 240, 52, 8, '#ffa94d', 'center');
+    ctx.fillStyle = '#0b0d1a'; ctx.fillRect(110, 76, 260, 28); ctx.fillStyle = '#ffd23f'; ctx.fillRect(112, 78, 256, 24); ctx.fillStyle = '#14182b'; ctx.fillRect(114, 80, 252, 20);
+    txt(L.nick + (blink ? '_' : ''), 240, 86, 8, '#ffffff', 'center');
+    txt('LETTERS, NUMBERS, SPACE AND - (MAX 10)', 240, 120, 8, '#5b6590', 'center');
+    txt('SHOWN TO EVERYONE IN YOUR ROOM', 240, 134, 8, '#7f8bb5', 'center');
+    txt('ENTER = SAVE   ESC = CANCEL', 240, 160, 8, blink ? '#ffd23f' : '#ffffff', 'center');
   } else if (L.st === 'fname') {
     txt('NEW FRIEND OR SAVED ROOM', 240, 44, 8, '#8fd3ff', 'center');
     txt('NICKNAME', 240, 74, 8, '#b8c4ee', 'center');
@@ -2528,7 +2566,7 @@ function drawTag(p, x, y) {
   const col = SLOT_COL[p.id], me = NET.role ? p.id === NET.me : !p.cpu;
   ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x - 7, y + 8, 15, 4);
   ctx.fillStyle = col; ctx.fillRect(x - 6, y + 9, 13, 2);                       // colour bar under the skates
-  txt(slotLabel(p.id), x, y - 29, 8, p.cpu ? '#9aa3c9' : col, 'center');         // R1 / B2 ... (dimmer for bots)
+  txt(p.cpu || !p.name ? slotLabel(p.id) : p.name.slice(0, 6), x, y - 29, 8, p.cpu ? '#9aa3c9' : col, 'center');   // player names (bots: R3 / B2), in each skater's own colour
   if (me) {                                                                       // little white arrow over your own skater
     ctx.fillStyle = '#14182b'; ctx.fillRect(x - 3, y - 20, 7, 2); ctx.fillRect(x - 2, y - 18, 5, 2); ctx.fillRect(x - 1, y - 16, 3, 1);
     ctx.fillStyle = '#ffffff'; ctx.fillRect(x - 2, y - 20, 5, 1); ctx.fillRect(x - 1, y - 19, 3, 1); ctx.fillRect(x, y - 18, 1, 1);
@@ -2740,7 +2778,7 @@ function pips(x, y, n, col) {
 }
 function roleLabel(id) {                                   // id = team
   if (NET.role && P.length > 2) return (id ? 'BLUE' : 'RED') + ' TEAM' + (P[NET.me] && P[NET.me].team === id ? ' (YOU)' : '');
-  if (NET.role) return P[NET.me] && P[NET.me].team === id ? 'YOU' : 'OPPONENT';
+  if (NET.role) { const q = leadOf(id); return (q.cpu ? 'CPU' : (q.name || 'PLAYER')).slice(0, 10) + (q === P[NET.me] ? ' (YOU)' : ''); }
   if (S.cpu) return id === S.cpuId ? 'CPU - ' + DIFF[S.level].name : 'YOU';
   return 'PLAYER ' + (id + 1);
 }
@@ -2807,7 +2845,7 @@ function drawTitle() {
 
   txt('TAB = FIGHTERS, CONTROLS, BADGES', 240, 248, 8, '#ffb100', 'center');
   txt('UP/DOWN PICK - LEFT/RIGHT CHANGE', 240, 262, 8, '#7f8bb5', 'center');
-  txt('1/2 QUICK START  O ONLINE  P PAUSE  F FULL', 240, 276, 8, '#5b6590', 'center');
+  txt('1/2 START  O ONLINE  N NAME  P PAUSE  F FULL', 240, 276, 8, '#5b6590', 'center');
 }
 function drawLock(x, y, col) {                       // 10x11 pixel padlock
   ctx.fillStyle = col; ctx.fillRect(x, y + 5, 10, 7); ctx.fillRect(x + 2, y, 2, 6); ctx.fillRect(x + 6, y, 2, 6); ctx.fillRect(x + 2, y, 6, 2);
@@ -3038,7 +3076,7 @@ function drawResults() {
   // final score
   const sb = (id, x) => {
     const c = CH[leadOf(id).char], team = id ? '#2a6fdb' : '#d62839';
-    const tag = NET.role ? (P.length > 2 ? (id ? 'BLUE' : 'RED') : (P[NET.me] && P[NET.me].team === id ? 'YOU' : 'OPP')) : S.cpu ? (id === S.cpuId ? 'CPU' : 'YOU') : 'P' + (id + 1);
+    const tag = NET.role ? (P.length > 2 ? (id ? 'BLUE' : 'RED') : (leadOf(id).name || 'PLAYER').slice(0, 6)) : S.cpu ? (id === S.cpuId ? 'CPU' : 'YOU') : 'P' + (id + 1);
     ctx.fillStyle = win === id ? '#ffd23f' : '#0b0d1a'; ctx.fillRect(x - 3, 55, 174, 60);
     ctx.fillStyle = '#0b0d1a'; ctx.fillRect(x - 1, 57, 170, 56);
     ctx.fillStyle = team; ctx.fillRect(x, 58, 168, 54);
